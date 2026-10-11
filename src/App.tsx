@@ -2150,8 +2150,11 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 starting a take never changes the score's width (which would re-lay it out mid-take). */}
             <aside style={styles.practiceSidebar} aria-label="Practice controls">
               <div style={styles.sidebarButtons}>
+                {/* Distinct keys: these replace one another in the same spot, and a reused element kept
+                    Practice!'s "disabled" (set while the microphone starts), so End Practice ignored taps. */}
                 {practiceMode === "active" ? (
                   <SlButton
+                    key="end"
                     className="end-button"
                     variant="danger"
                     size="large"
@@ -2165,11 +2168,12 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     {activeSpotRegion ? "Stop looping" : "End Practice"}
                   </SlButton>
                 ) : practiceMode === "counting_in" ? (
-                  <SlButton size="large" pill style={{ flex: 1 }} onClick={handleCancelCountIn}>
+                  <SlButton key="cancel" size="large" pill style={{ flex: 1 }} onClick={handleCancelCountIn}>
                     {trackingMode === "matchmaker" ? "Preparing… (cancel)" : "Counting in… (cancel)"}
                   </SlButton>
                 ) : (
                   <SlButton
+                    key="practice"
                     className="practice-button"
                     variant="warning"
                     size="large"
