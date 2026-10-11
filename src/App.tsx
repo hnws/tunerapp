@@ -147,6 +147,48 @@ export default function App(): ReactElement {
   // effect below depends on this).
   const [autoCorrectTimeSignatures, setAutoCorrectTimeSignatures] = useState(false);
 
+  // Load a default score on
+  // startup from /scores/default.musicxml if the deployment serves one (none there = start empty as
+  // before). ?score=<url> loads another one, ?score=none starts empty. Choosing a file afterwards
+  // replaces it as usual.
+  useEffect(() => {
+    const param = new URLSearchParams(window.location.search).get("score");
+    if (param === "none") {
+      return;
+    }
+    const url = param ?? "/scores/default.musicxml";
+    let cancelled = false;
+    setImportState("loading");
+    (async () => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok && param === null) {
+          if (!cancelled) {
+            setImportState("idle");
+          }
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Couldn't load the score at ${url} (HTTP ${response.status}).`);
+        }
+        const xmlData = await response.text();
+        const score = await importMusicXmlToScore(xmlData, { autoCorrectTimeSignatures: false });
+        if (!cancelled) {
+          setImportResult({ score, transientBoundingBoxes: [], xmlData });
+          setImportState("success");
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setImportError(err instanceof Error ? err.message : "Couldn't load the default score.");
+          setImportState("error");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // OMR/import correction panel (score/correctionUI/noteXmlCorrection.ts) -- "measureIndex:noteIndex"
   // keying a single ScoreNote (see that file's header comment for why notes are addressed this
   // way instead of by ScoreNote.id). Pitch/duration inputs represent "change to" and are left
