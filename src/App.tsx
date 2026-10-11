@@ -8,6 +8,7 @@ import {
 } from "../audio/captureModule";
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
 import { DEFAULT_APP_CONFIG, type AppConfig, type TrackingModeId } from "./appConfig";
+import { SlButton, SlCheckbox, SlDetails, SlInput, SlOption, SlRadioButton, SlRadioGroup, SlSelect, SlTab, SlTabGroup, eventChecked, eventValue, isOwnEvent } from "./ui";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
 import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight, type StartMarkerBox } from "../score/renderer";
@@ -36,6 +37,9 @@ const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
   { id: "practice", label: "Practice" }
 ];
 const TAB_STORAGE_KEY = "tunerapp.activeTab";
+// Shoelace options can't have an empty value; these stand for "" in the two selects that need it.
+const SYSTEM_DEFAULT_DEVICE = "system-default";
+const KEEP_DURATION = "keep";
 // Labels for the tracking modes a deployment offers (config.trackingModes; see src/appConfig.ts).
 const TRACKING_MODE_LABELS: Record<TrackingModeId, string> = {
   matchmaker: "Matchmaker (alignment server, recommended)",
@@ -158,6 +162,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   const [importError, setImportError] = useState<string | null>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const scoreContainerRef = useRef<HTMLDivElement | null>(null);
+  // Hidden native file inputs, opened from Shoelace buttons.
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const musicXmlInputRef = useRef<HTMLInputElement | null>(null);
   // Dev-only toggle: when a measure's parsed duration doesn't match its time signature (usually
   // HOMR missing a mid-piece meter change -- see musicxmlImport.ts's mismatch warning), infer and
   // insert a corrected time signature for that single measure instead of just warning. Off by
@@ -517,8 +524,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     };
   }, []);
 
-  function handleDeviceChange(event: ChangeEvent<HTMLSelectElement>): void {
-    setSelectedDeviceId(event.target.value);
+  function handleDeviceChange(value: string): void {
+    setSelectedDeviceId(value === SYSTEM_DEFAULT_DEVICE ? "" : value);
   }
 
   useEffect(() => {
@@ -545,8 +552,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
         setScoreCursor(resolvedHandle.cursor);
       })
       .catch((err) => {
+        console.error("Score render failed", err);
         if (!cancelled) {
-          setRenderError(err instanceof Error ? err.message : "Unknown error while rendering the score.");
+          setRenderError(err instanceof Error ? err.message : `Unknown error while rendering the score (${String(err)}).`);
         }
       });
 
@@ -1386,23 +1394,60 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
         button {
           font: inherit;
         }
+
+        /* Shoelace (see src/ui.ts): app font, compact spacing, and the one orange call to action. */
+        :root {
+          --sl-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        sl-tab-group.app-tabs {
+          margin-bottom: 10px;
+        }
+        sl-details.fold::part(base) {
+          background: rgba(255, 255, 255, 0.02);
+          border-color: rgba(255, 255, 255, 0.12);
+        }
+        sl-details.fold::part(header) {
+          padding: 8px 12px;
+        }
+        sl-details.fold::part(content) {
+          padding: 4px 12px 12px;
+        }
+        sl-checkbox {
+          display: block;
+          margin-top: 6px;
+        }
+        sl-radio-group.inline-group {
+          margin-top: 8px;
+        }
+        sl-radio-group.inline-group::part(form-control) {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+        sl-radio-group.inline-group::part(form-control-label) {
+          margin: 0;
+        }
+        sl-button.practice-button::part(base) {
+          background: linear-gradient(135deg, #ffc24b 0%, #ff7a3d 100%);
+          border: none;
+          color: #06111d;
+          font-weight: 800;
+          box-shadow: 0 6px 20px rgba(255, 122, 61, 0.4);
+        }
+        sl-button.practice-button[size="large"]::part(base) {
+          padding: 0 14px;
+        }
       `}</style>
 
       <main style={styles.shell}>
-        <nav style={styles.tabBar} role="tablist" aria-label="Screens">
+        <SlTabGroup className="app-tabs" onSlTabShow={(event) => selectTab(event.detail.name as AppTab)}>
           {APP_TABS.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.id}
-              style={activeTab === tab.id ? { ...styles.tab, ...styles.tabActive } : styles.tab}
-              onClick={() => selectTab(tab.id)}
-            >
+            <SlTab key={tab.id} slot="nav" panel={tab.id} active={activeTab === tab.id}>
               {tab.label}
-            </button>
+            </SlTab>
           ))}
-        </nav>
+        </SlTabGroup>
 
         <section style={activeTab === "tuner" ? styles.heroCard : { ...styles.heroCard, display: "none" }}>
           <div style={styles.topRow}>
@@ -1477,35 +1522,34 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
             </div>
           </div>
 
-          <label style={styles.deviceLabel}>
-            Microphone
-            <select
-              value={selectedDeviceId}
-              onChange={handleDeviceChange}
-              style={styles.deviceSelect}
-              disabled={captureState.status === "listening" || captureState.status === "calibrating"}
-            >
-              <option value="">System default</option>
-              {inputDevices.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Microphone ${index + 1}`}
-                </option>
-              ))}
-            </select>
-          </label>
+          <SlSelect
+            size="small"
+            label="Microphone"
+            style={{ marginTop: 12 }}
+            value={selectedDeviceId || SYSTEM_DEFAULT_DEVICE}
+            onSlChange={(event) => handleDeviceChange(eventValue(event))}
+            disabled={captureState.status === "listening" || captureState.status === "calibrating"}
+          >
+            <SlOption value={SYSTEM_DEFAULT_DEVICE}>System default</SlOption>
+            {inputDevices.map((device, index) => (
+              <SlOption key={device.deviceId || index} value={device.deviceId}>
+                {device.label || `Microphone ${index + 1}`}
+              </SlOption>
+            ))}
+          </SlSelect>
 
           {captureState.error ? <div style={styles.errorBox}>{captureState.error.message}</div> : null}
 
           <div style={styles.buttonRow}>
-            <button type="button" style={styles.primaryButton} onClick={handleStart} disabled={isStarting || captureState.status === "requesting"}>
+            <SlButton variant="primary" size="small" pill onClick={handleStart} disabled={isStarting || captureState.status === "requesting"}>
               {isStarting || captureState.status === "requesting" ? "Starting..." : "Start Microphone"}
-            </button>
-            <button type="button" style={styles.secondaryButton} onClick={handlePause} disabled={captureState.status !== "listening"}>
+            </SlButton>
+            <SlButton size="small" pill onClick={handlePause} disabled={captureState.status !== "listening"}>
               Pause
-            </button>
-            <button type="button" style={styles.secondaryButton} onClick={handleStop} disabled={captureState.status === "idle"}>
+            </SlButton>
+            <SlButton size="small" pill onClick={handleStop} disabled={captureState.status === "idle"}>
               Stop
-            </button>
+            </SlButton>
           </div>
 
           <p style={styles.caption}>
@@ -1515,87 +1559,100 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
 
         <section style={activeTab === "practice" ? styles.importCard : { ...styles.importCard, display: "none" }}>
           {captureState.error ? <div style={styles.errorBox}>Microphone: {captureState.error.message}</div> : null}
-          <details open={uploadOpen} onToggle={(event) => setUploadOpen(event.currentTarget.open)} style={styles.fold}>
-            <summary style={styles.foldSummary}>
+          <SlDetails
+            className="fold"
+            open={uploadOpen}
+            onSlShow={(event) => isOwnEvent(event) && setUploadOpen(true)}
+            onSlHide={(event) => isOwnEvent(event) && setUploadOpen(false)}
+          >
+            <div slot="summary">
               {importState === "success" && importResult ? `Sheet music: ${importResult.score.title}` : "Sheet music: upload a photo or MusicXML"}
               {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating, marginLeft: 10 }}>Loading…</span> : null}
-            </summary>
+            </div>
 
             <div style={styles.buttonRow}>
-              <label style={styles.secondaryButton}>
+              <SlButton size="small" pill onClick={() => photoInputRef.current?.click()}>
                 Choose sheet music photo
-                <input type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
-              </label>
-              <label style={styles.secondaryButton}>
+              </SlButton>
+              <input ref={photoInputRef} type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
+              <SlButton size="small" pill onClick={() => musicXmlInputRef.current?.click()}>
                 Choose MusicXML file
-                <input
-                  type="file"
-                  accept=".xml,.musicxml,application/vnd.recordare.musicxml+xml,text/xml,application/xml"
-                  onChange={handleMusicXmlFileSelected}
-                  style={styles.hiddenFileInput}
-                />
-              </label>
+              </SlButton>
+              <input
+                ref={musicXmlInputRef}
+                type="file"
+                accept=".xml,.musicxml,application/vnd.recordare.musicxml+xml,text/xml,application/xml"
+                onChange={handleMusicXmlFileSelected}
+                style={styles.hiddenFileInput}
+              />
               {importState === "success" && importResult ? (
-                <button type="button" style={styles.secondaryButton} onClick={handleDownloadMusicXml}>
+                <SlButton size="small" pill onClick={handleDownloadMusicXml}>
                   Download MusicXML
-                </button>
+                </SlButton>
               ) : null}
             </div>
 
             {config.showDevOptions ? (
-              <label style={styles.diagnosticHint}>
-                <input
-                  type="checkbox"
-                  checked={autoCorrectTimeSignatures}
-                  onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
-                />{" "}
+              <SlCheckbox
+                size="small"
+                style={{ marginTop: 10 }}
+                checked={autoCorrectTimeSignatures}
+                onSlChange={(event) => setAutoCorrectTimeSignatures(eventChecked(event))}
+              >
                 Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
                 signature -- usually a missed mid-piece meter change -- infer and insert a corrected
                 one for that bar, off by default; see score/timeSignatureInference.ts)
-              </label>
+              </SlCheckbox>
             ) : null}
 
             {practiceMode === "off" && correctableNotes.length > 0 ? (
-              <details style={styles.correctionPanel}>
-                <summary style={styles.foldSummary}>Fix a misread note</summary>
+              <SlDetails className="fold" summary="Fix a misread note" style={{ marginTop: 10 }}>
                 <div style={styles.correctionRow}>
-                  <select
+                  <SlSelect
+                    size="small"
+                    hoist
+                    style={{ minWidth: "18em" }}
                     value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
-                    onChange={(event) => setCorrectionNoteKey(event.target.value)}
+                    onSlChange={(event) => setCorrectionNoteKey(eventValue(event))}
                   >
                     {correctableNotes.map(({ measureIndex, noteIndex, note }) => (
-                      <option key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
+                      <SlOption key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
                         Measure {measureIndex + 1}, note {noteIndex + 1} — currently {note.pitch}
-                      </option>
+                      </SlOption>
                     ))}
-                  </select>
-                  <input
-                    type="text"
+                  </SlSelect>
+                  <SlInput
+                    size="small"
                     placeholder="Corrected pitch (e.g. C#4)"
                     value={correctionPitchInput}
-                    onChange={(event) => setCorrectionPitchInput(event.target.value)}
-                    style={{ width: "10em" }}
+                    onSlInput={(event) => setCorrectionPitchInput(eventValue(event))}
+                    style={{ width: "12em" }}
                   />
-                  <select value={correctionDurationInput} onChange={(event) => setCorrectionDurationInput(event.target.value)}>
-                    <option value="">Don't change duration</option>
+                  <SlSelect
+                    size="small"
+                    hoist
+                    value={correctionDurationInput === "" ? KEEP_DURATION : correctionDurationInput}
+                    onSlChange={(event) => setCorrectionDurationInput(eventValue(event) === KEEP_DURATION ? "" : eventValue(event))}
+                  >
+                    <SlOption value={KEEP_DURATION}>Don't change duration</SlOption>
                     {CORRECTION_DURATION_OPTIONS.map((option) => (
-                      <option key={option.label} value={option.quarterNotes}>
+                      <SlOption key={option.label} value={String(option.quarterNotes)}>
                         {option.label}
-                      </option>
+                      </SlOption>
                     ))}
-                  </select>
-                  <button type="button" style={styles.secondaryButton} onClick={handleApplyNoteCorrection}>
+                  </SlSelect>
+                  <SlButton size="small" pill onClick={handleApplyNoteCorrection}>
                     Apply
-                  </button>
+                  </SlButton>
                 </div>
                 <p style={styles.diagnosticHint}>
                   Fixes what OMR misread on a single note (pitch and/or duration) — not a full notation editor. Pick the
                   note, enter what it should be, and leave the other field blank to keep it as-is.
                 </p>
                 {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
-              </details>
+              </SlDetails>
             ) : null}
-          </details>
+          </SlDetails>
 
           {importState === "error" && importError ? <div style={styles.errorBox}>{importError}</div> : null}
 
@@ -1640,71 +1697,68 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
 
               <div style={styles.buttonRow}>
                 {practiceMode === "active" ? (
-                  <button
-                    type="button"
-                    style={styles.secondaryButton}
+                  <SlButton
+                    size="small"
+                    pill
                     onClick={() => {
                       handleStopLooping();
                       handleEndPracticing();
                     }}
                   >
                     {activeSpotRegion ? "Stop looping" : "End Practice"}
-                  </button>
+                  </SlButton>
                 ) : null}
                 {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" && !spotEnabled ? (
                   <span style={styles.diagnosticHint}>{jumpMessage ?? "Lost? Tap the note you're on to jump there."}</span>
                 ) : null}
                 {practiceMode === "active" ? null : practiceMode === "counting_in" ? (
-                  <button type="button" style={styles.secondaryButton} onClick={handleCancelCountIn}>
+                  <SlButton size="small" pill onClick={handleCancelCountIn}>
                     {trackingMode === "matchmaker" ? "Preparing score… (cancel)" : "Counting in… (cancel)"}
-                  </button>
+                  </SlButton>
                 ) : (
-                  <button
-                    type="button"
-                    style={!scoreCursor || isStarting || pendingAutoStartPractice ? { ...styles.practiceButton, opacity: 0.5, cursor: "default" } : styles.practiceButton}
+                  <SlButton
+                    className="practice-button"
+                    variant="warning"
+                    size="large"
+                    pill
                     onClick={handleRequestStartPracticing}
                     disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
                   >
                     {pendingAutoStartPractice || isStarting ? "Starting microphone…" : "Practice!"}
-                  </button>
+                  </SlButton>
                 )}
               </div>
 
 
               {practiceMode === "off" ? (
-                <div style={styles.diagnosticHint}>
-                  Tracking mode:{" "}
+                <SlRadioGroup
+                  size="small"
+                  label="Tracking"
+                  name="trackingMode"
+                  className="inline-group"
+                  value={trackingMode}
+                  onSlChange={(event) => setTrackingMode(eventValue(event) as TrackingModeId)}
+                >
                   {config.trackingModes.map((mode) => (
-                    <label key={mode} style={{ marginRight: 10 }}>
-                      <input
-                        type="radio"
-                        name="trackingMode"
-                        checked={trackingMode === mode}
-                        onChange={() => setTrackingMode(mode)}
-                      />{" "}
+                    <SlRadioButton key={mode} value={mode}>
                       {TRACKING_MODE_LABELS[mode]}
-                    </label>
+                    </SlRadioButton>
                   ))}
-                </div>
+                </SlRadioGroup>
               ) : null}
 
-              <label style={styles.diagnosticHint}>
-                <input
-                  type="checkbox"
-                  checked={autoScrollEnabled}
-                  onChange={(event) => handleAutoScrollChange(event.target.checked)}
-                />{" "}
+              <SlCheckbox size="small" checked={autoScrollEnabled} onSlChange={(event) => handleAutoScrollChange(eventChecked(event))}>
                 Auto-scroll to follow the music
-              </label>
+              </SlCheckbox>
 
               {practiceMode === "off" && !spotEnabled && scoreCursor ? (
                 <div style={styles.diagnosticHint}>
                   {startPoint && startMarker ? (
                     <>
                       Starts at bar {startMarker.barNumber} (▶ on the score) ·{" "}
-                      <button type="button" style={styles.linkButton} onClick={() => setStartPoint(null)}>
+                      <SlButton variant="text" size="small" onClick={() => setStartPoint(null)}>
                         Start from the beginning
-                      </button>
+                      </SlButton>
                       {trackingMode !== "matchmaker" ? " · only used in Matchmaker mode" : ""}
                     </>
                   ) : (
@@ -1715,17 +1769,17 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
 
               {trackingMode === "matchmaker" && practiceMode === "off" && !spotNextPassPending ? (
                 <div style={{ ...styles.diagnosticHint, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={spotEnabled}
-                      onChange={(event) => {
-                        setSpotEnabled(event.target.checked);
-                        if (!event.target.checked) handleStopLooping();
-                      }}
-                    />{" "}
+                  <SlCheckbox
+                    size="small"
+                    checked={spotEnabled}
+                    onSlChange={(event) => {
+                      const enabled = eventChecked(event);
+                      setSpotEnabled(enabled);
+                      if (!enabled) handleStopLooping();
+                    }}
+                  >
                     Loop a passage (spot practice)
-                  </label>
+                  </SlCheckbox>
                   {spotEnabled ? (
                     <>
                       <span>
@@ -1760,9 +1814,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     </ol>
                   ) : null}
                   {spotNextPassPending ? (
-                    <button type="button" style={styles.secondaryButton} onClick={handleStopLooping}>
+                    <SlButton size="small" pill onClick={handleStopLooping}>
                       Stop looping
-                    </button>
+                    </SlButton>
                   ) : null}
                 </div>
               ) : null}
@@ -1820,119 +1874,91 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
               ) : null}
 
               {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  Tempo{" "}
-                  <input
-                    type="number"
-                    min={20}
-                    max={300}
-                    value={metronomeBpm}
-                    // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
-                    // itself: entering "300" digit-by-digit passes through "3" first, which a
-                    // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
-                    // the field before a second digit could ever be typed. Clamp only once, on blur,
-                    // once the user is actually done editing; handleStartPracticing also clamps
-                    // defensively before constructing the follower regardless of blur.
-                    onChange={(event) => setMetronomeBpm(Number(event.target.value))}
-                    onBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
-                    style={{ width: "4em" }}
-                  />{" "}
-                  BPM -- the cursor advances on this clock alone; detected pitch is only compared
-                  against whatever note is currently scheduled, never used to decide when to move.
-                </label>
+                <SlInput
+                  size="small"
+                  type="number"
+                  label="Tempo (BPM)"
+                  helpText="The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
+                  min={20}
+                  max={300}
+                  value={String(metronomeBpm)}
+                  // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
+                  // itself: entering "300" digit-by-digit passes through "3" first, which a
+                  // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
+                  // the field before a second digit could ever be typed. Clamp only once, on blur,
+                  // once the user is actually done editing; handleStartPracticing also clamps
+                  // defensively before constructing the follower regardless of blur.
+                  onSlInput={(event) => setMetronomeBpm(Number(eventValue(event)))}
+                  onSlBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
+                  style={{ maxWidth: "26em", marginTop: 8 }}
+                />
               ) : null}
 
               {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={metronomeClickThroughoutEnabled}
-                    onChange={(event) => setMetronomeClickThroughoutEnabled(event.target.checked)}
-                  />{" "}
+                <SlCheckbox size="small" checked={metronomeClickThroughoutEnabled} onSlChange={(event) => setMetronomeClickThroughoutEnabled(eventChecked(event))}>
                   Click throughout practice, not just the one-bar count-in before it starts
-                </label>
+                </SlCheckbox>
               ) : null}
 
               {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={bowAttackDetectionEnabled}
-                    onChange={(event) => setBowAttackDetectionEnabled(event.target.checked)}
-                  />{" "}
+                <SlCheckbox size="small" checked={bowAttackDetectionEnabled} onSlChange={(event) => setBowAttackDetectionEnabled(eventChecked(event))}>
                   Bow attack detection (let a real bow attack shift the note boundary early/late,
                   off by default -- the cursor otherwise advances strictly on the beat, with no
                   dependency on detected pitch/onsets at all)
-                </label>
+                </SlCheckbox>
               ) : null}
 
               {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  Click subdivision{" "}
-                  <select
-                    value={clickSubdivision}
-                    onChange={(event) => setClickSubdivision(event.target.value as ClickSubdivision)}
-                  >
-                    <option value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</option>
-                    <option value="quarter">Quarter note</option>
-                    <option value="dottedQuarter">Dotted quarter (compound meter)</option>
-                    <option value="eighth">Eighth note</option>
-                  </select>
-                </label>
+                <SlSelect
+                  size="small"
+                  label="Click subdivision"
+                  style={{ maxWidth: "26em" }}
+                  value={clickSubdivision}
+                  onSlChange={(event) => setClickSubdivision(eventValue(event) as ClickSubdivision)}
+                >
+                  <SlOption value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</SlOption>
+                  <SlOption value="quarter">Quarter note</SlOption>
+                  <SlOption value="dottedQuarter">Dotted quarter (compound meter)</SlOption>
+                  <SlOption value="eighth">Eighth note</SlOption>
+                </SlSelect>
               ) : null}
 
               {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={fuzzySequenceMatchingEnabled}
-                    onChange={(event) => setFuzzySequenceMatchingEnabled(event.target.checked)}
-                  />{" "}
+                <SlCheckbox size="small" checked={fuzzySequenceMatchingEnabled} onSlChange={(event) => setFuzzySequenceMatchingEnabled(eventChecked(event))}>
                   Dev: fuzzy sequence matching (gap-tolerant resync, off by default -- see
                   ScoreFollowerConfig.fuzzySequenceMatchingEnabled)
-                </label>
+                </SlCheckbox>
               ) : null}
 
               {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
-                <label style={styles.diagnosticHint}>
-                  Dev: max consecutive missed notes a resync can bridge{" "}
-                  <input
-                    type="number"
-                    min={1}
-                    max={5}
-                    value={fuzzySequenceMaxSkips}
-                    onChange={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(event.target.value) || 1))}
-                    style={{ width: "3em" }}
-                  />{" "}
-                  (default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips)
-                </label>
+                <SlInput
+                  size="small"
+                  type="number"
+                  label="Dev: max consecutive missed notes a resync can bridge"
+                  helpText="Default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips"
+                  min={1}
+                  max={5}
+                  value={String(fuzzySequenceMaxSkips)}
+                  onSlInput={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(eventValue(event)) || 1))}
+                  style={{ maxWidth: "26em" }}
+                />
               ) : null}
 
               {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={adaptiveStabilityWindowEnabled}
-                    onChange={(event) => setAdaptiveStabilityWindowEnabled(event.target.checked)}
-                  />{" "}
+                <SlCheckbox size="small" checked={adaptiveStabilityWindowEnabled} onSlChange={(event) => setAdaptiveStabilityWindowEnabled(eventChecked(event))}>
                   Dev: adaptive stability window (tempo-scaled implicit-onset timing, off by
                   default -- see ScoreFollowerConfig.adaptiveStabilityWindowEnabled)
-                </label>
+                </SlCheckbox>
               ) : null}
 
               {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={energyOnsetFusionEnabled}
-                    onChange={(event) => setEnergyOnsetFusionEnabled(event.target.checked)}
-                  />{" "}
+                <SlCheckbox size="small" checked={energyOnsetFusionEnabled} onSlChange={(event) => setEnergyOnsetFusionEnabled(eventChecked(event))}>
                   Dev: energy onset fusion (adds a second onset detector + extra settle time on
                   single-detector onsets, off by default -- see
                   ScoreFollowerConfig.energyOnsetFusionEnabled). Takes effect on the NEXT
                   microphone start, not while it's already running -- stop and restart the mic
                   above after changing this.
-                </label>
+                </SlCheckbox>
               ) : null}
 
               {renderError ? <div style={styles.errorBox}>Could not render this score: {renderError}</div> : null}
@@ -2034,26 +2060,18 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                       : ""}
                     {sessionSummary.averageCentsError.toFixed(1)} cents average error.
                   </p>
-                  <div style={styles.diagnosticHint} role="radiogroup" aria-label="Grade against">
-                    Grade against:{" "}
-                    <label>
-                      <input
-                        type="radio"
-                        name="grade-reference"
-                        checked={gradeReference === "own"}
-                        onChange={() => setGradeReference("own")}
-                      />{" "}
-                      my own tuning
-                    </label>{" "}
-                    <label>
-                      <input
-                        type="radio"
-                        name="grade-reference"
-                        checked={gradeReference === "a440"}
-                        onChange={() => setGradeReference("a440")}
-                      />{" "}
-                      A440
-                    </label>
+                  <div style={styles.diagnosticHint}>
+                    <SlRadioGroup
+                      size="small"
+                      label="Grade against"
+                      name="grade-reference"
+                      className="inline-group"
+                      value={gradeReference}
+                      onSlChange={(event) => setGradeReference(eventValue(event) === "own" ? "own" : "a440")}
+                    >
+                      <SlRadioButton value="own">My own tuning</SlRadioButton>
+                      <SlRadioButton value="a440">A440</SlRadioButton>
+                    </SlRadioGroup>
                     {gradeReference === "own" && sessionSummary.referenceSource !== "a440"
                       ? ` — your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${
                           sessionSummary.referenceCents >= 0 ? "+" : ""
@@ -2069,20 +2087,21 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                       {gradeReference === "own" ? ', or grade against A440 so fingered notes aren\'t marked off because of it' : ""}.
                     </p>
                   ) : null}
-                  <div style={styles.diagnosticHint} role="radiogroup" aria-label="Strictness">
-                    Strictness:{" "}
-                    {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
-                      <label key={key} style={{ marginRight: 10 }}>
-                        <input
-                          type="radio"
-                          name="grade-strictness"
-                          checked={gradeStrictness === key}
-                          onChange={() => chooseStrictness(key)}
-                        />{" "}
-                        {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
-                      </label>
-                    ))}
-                    <br />
+                  <div style={styles.diagnosticHint}>
+                    <SlRadioGroup
+                      size="small"
+                      label="Strictness"
+                      name="grade-strictness"
+                      className="inline-group"
+                      value={gradeStrictness}
+                      onSlChange={(event) => chooseStrictness(eventValue(event) as GradeStrictness)}
+                    >
+                      {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
+                        <SlRadioButton key={key} value={key}>
+                          {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
+                        </SlRadioButton>
+                      ))}
+                    </SlRadioGroup>
                     <span style={{ color: "#8ee8cb" }}>Green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
                     <span style={{ color: "#ffb020" }}>amber</span> up to ±{STRICTNESS_BANDS[gradeStrictness].closeCents}¢,{" "}
                     <span style={{ color: "#ff4d4d" }}>red</span> beyond, <span style={{ color: "#a07ee0" }}>purple</span> too fast or
@@ -2095,9 +2114,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   ) : null}
                   <div style={styles.buttonRow}>
                     {takeAvailable && lastTakeRef.current ? (
-                      <button
-                        type="button"
-                        style={styles.secondaryButton}
+                      <SlButton
+                        size="small"
+                        pill
                         onClick={() => {
                           const saved = lastTakeRef.current;
                           if (!saved || !followerState) return;
@@ -2114,11 +2133,11 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                         }}
                       >
                         Download this take
-                      </button>
+                      </SlButton>
                     ) : null}
-                    <button type="button" style={styles.primaryButton} onClick={() => handleStartPracticing()}>
+                    <SlButton className="practice-button" variant="warning" pill onClick={() => handleStartPracticing()}>
                       Practice again
-                    </button>
+                    </SlButton>
                   </div>
                 </div>
               ) : null}
@@ -2263,56 +2282,11 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "14px",
     fontWeight: 600
   },
-  deviceLabel: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "8px",
-    marginTop: "12px",
-    color: "rgba(204, 214, 232, 0.7)",
-    fontSize: "12px",
-    textTransform: "uppercase",
-    letterSpacing: "0.08em",
-    maxWidth: "360px"
-  },
-  deviceSelect: {
-    font: "inherit",
-    textTransform: "none",
-    letterSpacing: "normal",
-    fontSize: "14px",
-    padding: "6px 10px",
-    borderRadius: "8px",
-    background: "rgba(255, 255, 255, 0.04)",
-    border: "1px solid rgba(255, 255, 255, 0.14)",
-    color: "#f5f7fb"
-  },
   buttonRow: {
     display: "flex",
     flexWrap: "wrap",
     gap: "8px",
     marginTop: "12px"
-  },
-  primaryButton: {
-    border: "none",
-    borderRadius: "999px",
-    padding: "8px 14px",
-    fontSize: "14px",
-    background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
-    color: "#06111d",
-    fontWeight: 700,
-    cursor: "pointer"
-  },
-  // The one button to press on the Practice tab: a warm colour used nowhere else (the tabs and
-  // the tuner's buttons are teal/blue), a little larger.
-  practiceButton: {
-    border: "none",
-    borderRadius: "999px",
-    padding: "10px 30px",
-    background: "linear-gradient(135deg, #ffc24b 0%, #ff7a3d 100%)",
-    boxShadow: "0 6px 20px rgba(255, 122, 61, 0.4)",
-    color: "#06111d",
-    fontSize: "16px",
-    fontWeight: 800,
-    cursor: "pointer"
   },
   secondaryButton: {
     border: "1px solid rgba(255, 255, 255, 0.14)",
@@ -2347,32 +2321,6 @@ const styles: Record<string, CSSProperties> = {
     boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
     padding: "16px"
   },
-  tabBar: {
-    display: "flex",
-    gap: "8px",
-    marginBottom: "10px"
-  },
-  tab: {
-    border: "1px solid rgba(255, 255, 255, 0.14)",
-    borderRadius: "999px",
-    padding: "7px 18px",
-    fontSize: "14px",
-    background: "rgba(255, 255, 255, 0.04)",
-    color: "#f5f7fb",
-    fontWeight: 600,
-    cursor: "pointer"
-  },
-  tabActive: {
-    border: "1px solid transparent",
-    background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
-    color: "#06111d",
-    fontWeight: 700
-  },
-  subtitle: {
-    margin: "8px 0 0",
-    fontSize: "clamp(1.05rem, 2vw, 1.3rem)",
-    letterSpacing: "-0.03em"
-  },
   hiddenFileInput: {
     position: "absolute",
     width: "1px",
@@ -2387,38 +2335,12 @@ const styles: Record<string, CSSProperties> = {
   importResult: {
     marginTop: "8px"
   },
-  correctionPanel: {
-    marginTop: "10px",
-    padding: "8px 12px",
-    borderRadius: "10px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: "1px solid rgba(255, 255, 255, 0.08)"
-  },
   correctionRow: {
     display: "flex",
     flexWrap: "wrap",
     gap: "10px",
     alignItems: "center",
     marginTop: "8px"
-  },
-  fold: {
-    marginTop: "4px"
-  },
-  foldSummary: {
-    cursor: "pointer",
-    fontSize: "14px",
-    fontWeight: 600,
-    color: "#c8d3e3",
-    padding: "4px 0"
-  },
-  linkButton: {
-    border: "none",
-    background: "none",
-    padding: 0,
-    font: "inherit",
-    color: "#8ee8cb",
-    textDecoration: "underline",
-    cursor: "pointer"
   },
   startMarkerLabel: {
     position: "absolute",

@@ -18,6 +18,7 @@
     "spotPracticeTest": "tsx practice/__tests__/spot-practice-harness.ts"
   },
   "dependencies": {
+    "@shoelace-style/shoelace": "^2.20.1",
     "opensheetmusicdisplay": "^2.1.2",
     "pitchfinder": "^2.3.2",
     "react": "^19.2.8",
