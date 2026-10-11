@@ -47,6 +47,7 @@ const TRACKING_MODE_LABELS: Record<TrackingModeId, string> = {
   listening: "Listening (pitch/onset-driven)"
 };
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
+const SETTINGS_OPEN_STORAGE_KEY = "tunerapp.settingsOpen";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
 // next line is visible below it).
@@ -253,6 +254,24 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     }
   }, [importState]);
 
+  // The Settings fold (tracking, auto-scroll, grading) starts folded; remembered per browser.
+  const [settingsOpen, setSettingsOpen] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(SETTINGS_OPEN_STORAGE_KEY) === "open";
+    } catch {
+      return false;
+    }
+  });
+
+  function handleSettingsOpenChange(open: boolean): void {
+    setSettingsOpen(open);
+    try {
+      window.localStorage.setItem(SETTINGS_OPEN_STORAGE_KEY, open ? "open" : "closed");
+    } catch {
+      // Storage unavailable: the fold just starts folded next time.
+    }
+  }
+
   // Keep the cursor in view while practising (remembered per browser, on by default).
   const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
     try {
@@ -425,8 +444,23 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   const [takeAvailable, setTakeAvailable] = useState(false);
   const [offlineScoringProgress, setOfflineScoringProgress] = useState<number | null>(null);
   const [matchmakerError, setMatchmakerError] = useState<string | null>(null);
-  // How the finished take is graded -- see practice/reviewSummary.ts. "own" by default.
-  const [gradeReference, setGradeReference] = useState<GradeReference>(DEFAULT_GRADING.reference);
+  // How the finished take is graded -- see practice/reviewSummary.ts. A440 by default; remembered per browser.
+  const [gradeReference, setGradeReference] = useState<GradeReference>(() => {
+    try {
+      const saved = localStorage.getItem("tunerapp.gradeReference");
+      return saved === "own" || saved === "a440" ? saved : DEFAULT_GRADING.reference;
+    } catch {
+      return DEFAULT_GRADING.reference;
+    }
+  });
+  const chooseGradeReference = (value: GradeReference) => {
+    setGradeReference(value);
+    try {
+      localStorage.setItem("tunerapp.gradeReference", value);
+    } catch {
+      // Storage unavailable (private window): the choice just won't persist.
+    }
+  };
   // Green/amber band widths (practice/reviewSummary.ts STRICTNESS_BANDS). Remembered per browser.
   const [gradeStrictness, setGradeStrictness] = useState<GradeStrictness>(() => {
     try {
@@ -1224,8 +1258,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   // "stopped" checks below), rather than silently abandoning the session like
   // handleStopPracticing() (still used as-is by the automatic mic-disconnect safety net above,
   // where popping up a summary doesn't make sense). Deliberately leaves practiceMode "active",
-  // matching how natural completion already behaves -- "Practice again" is the only way back in,
-  // same as today.
+  // matching how natural completion already behaves; the session effect then returns it to "off",
+  // which brings the Practice! button back for the next take.
   function handleEndPracticing(): void {
     followerRef.current?.stop();
     beatClockRef.current?.stop();
@@ -1730,7 +1764,24 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
               </div>
 
 
-              {practiceMode === "off" ? (
+              {/* Every practice setting in one fold. How a take is tracked can only change between
+                  takes; auto-scroll and grading apply at once (grading recolours the last take). */}
+              <SlDetails
+                className="fold settings-fold"
+                open={settingsOpen}
+                onSlShow={(event) => isOwnEvent(event) && handleSettingsOpenChange(true)}
+                onSlHide={(event) => isOwnEvent(event) && handleSettingsOpenChange(false)}
+              >
+                <div slot="summary">
+                  <strong>Settings</strong>
+                  <span style={styles.foldSummaryHint}>
+                    {" "}
+                    · {TRACKING_MODE_LABELS[trackingMode]}
+                    {trackingMode === "metronome" ? ` ${metronomeBpm} BPM` : ""} · auto-scroll {autoScrollEnabled ? "on" : "off"} ·{" "}
+                    {gradeReference === "a440" ? "A440" : "own tuning"} · {STRICTNESS_BANDS[gradeStrictness].label}
+                  </span>
+                </div>
+
                 <SlRadioGroup
                   size="small"
                   label="Tracking"
@@ -1740,16 +1791,144 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   onSlChange={(event) => setTrackingMode(eventValue(event) as TrackingModeId)}
                 >
                   {config.trackingModes.map((mode) => (
-                    <SlRadioButton key={mode} value={mode}>
+                    <SlRadioButton key={mode} value={mode} disabled={practiceMode !== "off"}>
                       {TRACKING_MODE_LABELS[mode]}
                     </SlRadioButton>
                   ))}
                 </SlRadioGroup>
-              ) : null}
 
-              <SlCheckbox size="small" checked={autoScrollEnabled} onSlChange={(event) => handleAutoScrollChange(eventChecked(event))}>
-                Auto-scroll to follow the music
-              </SlCheckbox>
+                {trackingMode === "metronome" ? (
+                  <SlInput
+                    size="small"
+                    type="number"
+                    label="Tempo (BPM)"
+                    helpText="The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
+                    min={20}
+                    max={300}
+                    value={String(metronomeBpm)}
+                    disabled={practiceMode !== "off"}
+                    // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
+                    // itself: entering "300" digit-by-digit passes through "3" first, which a
+                    // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
+                    // the field before a second digit could ever be typed. Clamp only once, on blur,
+                    // once the user is actually done editing; handleStartPracticing also clamps
+                    // defensively before constructing the follower regardless of blur.
+                    onSlInput={(event) => setMetronomeBpm(Number(eventValue(event)))}
+                    onSlBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
+                    style={{ maxWidth: "26em", marginTop: 8 }}
+                  />
+                ) : null}
+
+                {trackingMode === "metronome" ? (
+                  <SlCheckbox
+                    size="small"
+                    checked={metronomeClickThroughoutEnabled}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setMetronomeClickThroughoutEnabled(eventChecked(event))}
+                  >
+                    Click throughout practice, not just the one-bar count-in before it starts
+                  </SlCheckbox>
+                ) : null}
+
+                {trackingMode === "metronome" ? (
+                  <SlCheckbox
+                    size="small"
+                    checked={bowAttackDetectionEnabled}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setBowAttackDetectionEnabled(eventChecked(event))}
+                  >
+                    Bow attack detection (let a real bow attack shift the note boundary early/late,
+                    off by default -- the cursor otherwise advances strictly on the beat, with no
+                    dependency on detected pitch/onsets at all)
+                  </SlCheckbox>
+                ) : null}
+
+                {trackingMode === "metronome" ? (
+                  <SlSelect
+                    size="small"
+                    label="Click subdivision"
+                    hoist
+                    style={{ maxWidth: "26em", marginTop: 8 }}
+                    value={clickSubdivision}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setClickSubdivision(eventValue(event) as ClickSubdivision)}
+                  >
+                    <SlOption value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</SlOption>
+                    <SlOption value="quarter">Quarter note</SlOption>
+                    <SlOption value="dottedQuarter">Dotted quarter (compound meter)</SlOption>
+                    <SlOption value="eighth">Eighth note</SlOption>
+                  </SlSelect>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={fuzzySequenceMatchingEnabled} onSlChange={(event) => setFuzzySequenceMatchingEnabled(eventChecked(event))}>
+                    Dev: fuzzy sequence matching (gap-tolerant resync, off by default -- see
+                    ScoreFollowerConfig.fuzzySequenceMatchingEnabled)
+                  </SlCheckbox>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
+                  <SlInput
+                    size="small"
+                    type="number"
+                    label="Dev: max consecutive missed notes a resync can bridge"
+                    helpText="Default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips"
+                    min={1}
+                    max={5}
+                    value={String(fuzzySequenceMaxSkips)}
+                    onSlInput={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(eventValue(event)) || 1))}
+                    style={{ maxWidth: "26em" }}
+                  />
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={adaptiveStabilityWindowEnabled} onSlChange={(event) => setAdaptiveStabilityWindowEnabled(eventChecked(event))}>
+                    Dev: adaptive stability window (tempo-scaled implicit-onset timing, off by
+                    default -- see ScoreFollowerConfig.adaptiveStabilityWindowEnabled)
+                  </SlCheckbox>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={energyOnsetFusionEnabled} onSlChange={(event) => setEnergyOnsetFusionEnabled(eventChecked(event))}>
+                    Dev: energy onset fusion (adds a second onset detector + extra settle time on
+                    single-detector onsets, off by default -- see
+                    ScoreFollowerConfig.energyOnsetFusionEnabled). Takes effect on the NEXT
+                    microphone start, not while it's already running -- stop and restart the mic
+                    above after changing this.
+                  </SlCheckbox>
+                ) : null}
+
+                <SlCheckbox size="small" checked={autoScrollEnabled} onSlChange={(event) => handleAutoScrollChange(eventChecked(event))}>
+                  Auto-scroll to follow the music
+                </SlCheckbox>
+
+                <SlRadioGroup
+                  size="small"
+                  label="Grade against"
+                  name="grade-reference"
+                  className="inline-group"
+                  value={gradeReference}
+                  onSlChange={(event) => chooseGradeReference(eventValue(event) === "own" ? "own" : "a440")}
+                >
+                  <SlRadioButton value="a440">A440</SlRadioButton>
+                  <SlRadioButton value="own">My own tuning</SlRadioButton>
+                </SlRadioGroup>
+
+                <SlRadioGroup
+                  size="small"
+                  label="Strictness"
+                  name="grade-strictness"
+                  className="inline-group"
+                  value={gradeStrictness}
+                  onSlChange={(event) => chooseStrictness(eventValue(event) as GradeStrictness)}
+                >
+                  {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
+                    <SlRadioButton key={key} value={key}>
+                      {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
+                    </SlRadioButton>
+                  ))}
+                </SlRadioGroup>
+              </SlDetails>
 
               {practiceMode === "off" && !spotEnabled && scoreCursor ? (
                 <div style={styles.diagnosticHint}>
@@ -1873,94 +2052,6 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 </div>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <SlInput
-                  size="small"
-                  type="number"
-                  label="Tempo (BPM)"
-                  helpText="The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
-                  min={20}
-                  max={300}
-                  value={String(metronomeBpm)}
-                  // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
-                  // itself: entering "300" digit-by-digit passes through "3" first, which a
-                  // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
-                  // the field before a second digit could ever be typed. Clamp only once, on blur,
-                  // once the user is actually done editing; handleStartPracticing also clamps
-                  // defensively before constructing the follower regardless of blur.
-                  onSlInput={(event) => setMetronomeBpm(Number(eventValue(event)))}
-                  onSlBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
-                  style={{ maxWidth: "26em", marginTop: 8 }}
-                />
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <SlCheckbox size="small" checked={metronomeClickThroughoutEnabled} onSlChange={(event) => setMetronomeClickThroughoutEnabled(eventChecked(event))}>
-                  Click throughout practice, not just the one-bar count-in before it starts
-                </SlCheckbox>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <SlCheckbox size="small" checked={bowAttackDetectionEnabled} onSlChange={(event) => setBowAttackDetectionEnabled(eventChecked(event))}>
-                  Bow attack detection (let a real bow attack shift the note boundary early/late,
-                  off by default -- the cursor otherwise advances strictly on the beat, with no
-                  dependency on detected pitch/onsets at all)
-                </SlCheckbox>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <SlSelect
-                  size="small"
-                  label="Click subdivision"
-                  style={{ maxWidth: "26em" }}
-                  value={clickSubdivision}
-                  onSlChange={(event) => setClickSubdivision(eventValue(event) as ClickSubdivision)}
-                >
-                  <SlOption value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</SlOption>
-                  <SlOption value="quarter">Quarter note</SlOption>
-                  <SlOption value="dottedQuarter">Dotted quarter (compound meter)</SlOption>
-                  <SlOption value="eighth">Eighth note</SlOption>
-                </SlSelect>
-              ) : null}
-
-              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <SlCheckbox size="small" checked={fuzzySequenceMatchingEnabled} onSlChange={(event) => setFuzzySequenceMatchingEnabled(eventChecked(event))}>
-                  Dev: fuzzy sequence matching (gap-tolerant resync, off by default -- see
-                  ScoreFollowerConfig.fuzzySequenceMatchingEnabled)
-                </SlCheckbox>
-              ) : null}
-
-              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
-                <SlInput
-                  size="small"
-                  type="number"
-                  label="Dev: max consecutive missed notes a resync can bridge"
-                  helpText="Default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips"
-                  min={1}
-                  max={5}
-                  value={String(fuzzySequenceMaxSkips)}
-                  onSlInput={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(eventValue(event)) || 1))}
-                  style={{ maxWidth: "26em" }}
-                />
-              ) : null}
-
-              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <SlCheckbox size="small" checked={adaptiveStabilityWindowEnabled} onSlChange={(event) => setAdaptiveStabilityWindowEnabled(eventChecked(event))}>
-                  Dev: adaptive stability window (tempo-scaled implicit-onset timing, off by
-                  default -- see ScoreFollowerConfig.adaptiveStabilityWindowEnabled)
-                </SlCheckbox>
-              ) : null}
-
-              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
-                <SlCheckbox size="small" checked={energyOnsetFusionEnabled} onSlChange={(event) => setEnergyOnsetFusionEnabled(eventChecked(event))}>
-                  Dev: energy onset fusion (adds a second onset detector + extra settle time on
-                  single-detector onsets, off by default -- see
-                  ScoreFollowerConfig.energyOnsetFusionEnabled). Takes effect on the NEXT
-                  microphone start, not while it's already running -- stop and restart the mic
-                  above after changing this.
-                </SlCheckbox>
-              ) : null}
-
               {renderError ? <div style={styles.errorBox}>Could not render this score: {renderError}</div> : null}
 
               <div
@@ -2061,59 +2152,33 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     {sessionSummary.averageCentsError.toFixed(1)} cents average error.
                   </p>
                   <div style={styles.diagnosticHint}>
-                    <SlRadioGroup
-                      size="small"
-                      label="Grade against"
-                      name="grade-reference"
-                      className="inline-group"
-                      value={gradeReference}
-                      onSlChange={(event) => setGradeReference(eventValue(event) === "own" ? "own" : "a440")}
-                    >
-                      <SlRadioButton value="own">My own tuning</SlRadioButton>
-                      <SlRadioButton value="a440">A440</SlRadioButton>
-                    </SlRadioGroup>
+                    Graded against{" "}
                     {gradeReference === "own" && sessionSummary.referenceSource !== "a440"
-                      ? ` — your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${
+                      ? `your own tuning (your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${
                           sessionSummary.referenceCents >= 0 ? "+" : ""
-                        }${sessionSummary.referenceCents.toFixed(0)}¢ from A440`
-                      : ""}
-                    .
+                        }${sessionSummary.referenceCents.toFixed(0)}¢ from A440)`
+                      : "A440"}
+                    , {STRICTNESS_BANDS[gradeStrictness].label.toLowerCase()} (change in Settings):{" "}
+                    <span style={{ color: "#8ee8cb" }}>green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
+                    <span style={{ color: "#ffb020" }}>amber</span> up to ±{STRICTNESS_BANDS[gradeStrictness].closeCents}¢,{" "}
+                    <span style={{ color: "#ff4d4d" }}>red</span> beyond, <span style={{ color: "#a07ee0" }}>purple</span> too fast or
+                    unclear to measure, <span style={{ color: "#9aa0a6" }}>grey</span> not played.
                   </div>
                   {sessionSummary.stringDriftCents !== null && Math.abs(sessionSummary.stringDriftCents) > 8 ? (
                     <p style={{ ...styles.diagnosticHint, color: "#ffb020" }}>
                       Your open strings were about {Math.abs(sessionSummary.stringDriftCents).toFixed(0)}¢{" "}
                       {sessionSummary.stringDriftCents < 0 ? "flat" : "sharp"} of your fingered notes. They may have
                       drifted: retune before the next take
-                      {gradeReference === "own" ? ', or grade against A440 so fingered notes aren\'t marked off because of it' : ""}.
+                      {gradeReference === "own" ? ', or grade against A440 (Settings) so fingered notes aren\'t marked off because of it' : ""}.
                     </p>
                   ) : null}
-                  <div style={styles.diagnosticHint}>
-                    <SlRadioGroup
-                      size="small"
-                      label="Strictness"
-                      name="grade-strictness"
-                      className="inline-group"
-                      value={gradeStrictness}
-                      onSlChange={(event) => chooseStrictness(eventValue(event) as GradeStrictness)}
-                    >
-                      {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
-                        <SlRadioButton key={key} value={key}>
-                          {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
-                        </SlRadioButton>
-                      ))}
-                    </SlRadioGroup>
-                    <span style={{ color: "#8ee8cb" }}>Green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
-                    <span style={{ color: "#ffb020" }}>amber</span> up to ±{STRICTNESS_BANDS[gradeStrictness].closeCents}¢,{" "}
-                    <span style={{ color: "#ff4d4d" }}>red</span> beyond, <span style={{ color: "#a07ee0" }}>purple</span> too fast or
-                    unclear to measure, <span style={{ color: "#9aa0a6" }}>grey</span> not played.
-                  </div>
                   {finalScoringSource === "live" ? (
                     <p style={styles.diagnosticHint}>
                       Approximate: the full-recording analysis didn't finish, so this uses the live estimate.
                     </p>
                   ) : null}
-                  <div style={styles.buttonRow}>
-                    {takeAvailable && lastTakeRef.current ? (
+                  {takeAvailable && lastTakeRef.current ? (
+                    <div style={styles.buttonRow}>
                       <SlButton
                         size="small"
                         pill
@@ -2134,11 +2199,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                       >
                         Download this take
                       </SlButton>
-                    ) : null}
-                    <SlButton className="practice-button" variant="warning" pill onClick={() => handleStartPracticing()}>
-                      Practice again
-                    </SlButton>
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -2263,6 +2325,10 @@ const styles: Record<string, CSSProperties> = {
     color: "rgba(204, 214, 232, 0.68)",
     fontSize: "13px",
     lineHeight: 1.4
+  },
+  foldSummaryHint: {
+    color: "rgba(204, 214, 232, 0.68)",
+    fontSize: "13px"
   },
   metaRow: {
     display: "grid",
