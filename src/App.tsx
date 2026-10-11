@@ -40,17 +40,17 @@ const TAB_STORAGE_KEY = "tunerapp.activeTab";
 // Shoelace options can't have an empty value; these stand for "" in the two selects that need it.
 const SYSTEM_DEFAULT_DEVICE = "system-default";
 const KEEP_DURATION = "keep";
-// Labels for the tracking modes a deployment offers (config.trackingModes; see src/appConfig.ts).
-const TRACKING_MODE_LABELS: Record<TrackingModeId, string> = {
-  matchmaker: "Matchmaker (alignment server, recommended)",
-  metronome: "Metronome (tempo-driven, no pitch tracking)",
-  listening: "Listening (pitch/onset-driven)"
-};
-// The same modes, named briefly for the folded Settings header.
+// Names and one-line descriptions of the tracking modes a deployment offers (config.trackingModes;
+// see src/appConfig.ts), as shown in the Settings drawer and the side column.
 const TRACKING_MODE_SHORT_LABELS: Record<TrackingModeId, string> = {
   matchmaker: "Matchmaker",
   metronome: "Metronome",
   listening: "Listening"
+};
+const TRACKING_MODE_DESCRIPTIONS: Record<TrackingModeId, string> = {
+  matchmaker: "Follows your playing (alignment server) and grades after the take. Best for bowed parts.",
+  metronome: "The cursor moves at a set tempo; play along with the click. Pitch is still graded. Best for plucked parts.",
+  listening: "Follows detected pitch and note starts in the browser (experimental)."
 };
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
@@ -1742,6 +1742,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 <SlRadioGroup
                   size="small"
                   label="Tracking"
+                  helpText={TRACKING_MODE_DESCRIPTIONS[trackingMode]}
                   name="trackingMode"
                   className="inline-group"
                   value={trackingMode}
@@ -1749,7 +1750,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 >
                   {config.trackingModes.map((mode) => (
                     <SlRadioButton key={mode} value={mode} disabled={practiceMode !== "off"}>
-                      {TRACKING_MODE_LABELS[mode]}
+                      {TRACKING_MODE_SHORT_LABELS[mode]}
                     </SlRadioButton>
                   ))}
                 </SlRadioGroup>
