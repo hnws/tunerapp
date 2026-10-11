@@ -266,7 +266,7 @@ export default function App(): ReactElement {
 
   const followerRef = useRef<ScoreFollower | MetronomeScoreFollower | MatchmakerScoreFollower | null>(null);
   const matchmakerStreamRef = useRef<MatchmakerStream | null>(null);
-  // The current Matchmaker session's note list and quarter index, for "Jump to bar".
+  // The current Matchmaker session's note list and quarter index, for jumping by tapping a note.
   const sessionNotesRef = useRef<{ notes: CursorNoteInfo[]; quarterIndex: QuarterIndexEntry[] } | null>(null);
   // Spot practice (practice/spotPractice.ts): loop bars From-To, one graded pass at a time.
   const [spotEnabled, setSpotEnabled] = useState(false);
@@ -340,7 +340,7 @@ export default function App(): ReactElement {
   const [trackingMode, setTrackingMode] = useState<"listening" | "metronome" | "matchmaker">("matchmaker");
 
   // "Start here": click a note on the score (while not practising) to start the next Matchmaker
-  // take from it -- the same seek "Jump to bar" makes, sent before any audio. Clicking the first
+  // take from it -- the same seek a tap-to-jump makes, sent before any audio. Clicking the first
   // note clears it. sessionStartRegion is what the running/last take actually used, so the summary
   // and the colours cover only the notes from the start onwards.
   const [startPoint, setStartPoint] = useState<{ quarter: number; stepIndex: number } | null>(null);
@@ -1040,7 +1040,7 @@ export default function App(): ReactElement {
     }
     beginFollowing();
     if (spotRegion && followerRef.current instanceof MatchmakerScoreFollower) {
-      // Every pass starts at the loop's first note: the same jump "Jump to bar" makes, sent before
+      // Every pass starts at the loop's first note: the same jump a tapped note makes, sent before
       // any audio, so both the live follower and the post-take alignment start there.
       stream.seek(spotRegion.fromQuarter);
       followerRef.current.jumpToQuarter(spotRegion.fromQuarter);
@@ -1542,6 +1542,47 @@ export default function App(): ReactElement {
               signature -- usually a missed mid-piece meter change -- infer and insert a corrected
               one for that bar, off by default; see score/timeSignatureInference.ts)
             </label>
+
+            {practiceMode === "off" && correctableNotes.length > 0 ? (
+              <details style={styles.correctionPanel}>
+                <summary style={styles.foldSummary}>Fix a misread note</summary>
+                <div style={styles.correctionRow}>
+                  <select
+                    value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
+                    onChange={(event) => setCorrectionNoteKey(event.target.value)}
+                  >
+                    {correctableNotes.map(({ measureIndex, noteIndex, note }) => (
+                      <option key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
+                        Measure {measureIndex + 1}, note {noteIndex + 1} — currently {note.pitch}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="Corrected pitch (e.g. C#4)"
+                    value={correctionPitchInput}
+                    onChange={(event) => setCorrectionPitchInput(event.target.value)}
+                    style={{ width: "10em" }}
+                  />
+                  <select value={correctionDurationInput} onChange={(event) => setCorrectionDurationInput(event.target.value)}>
+                    <option value="">Don't change duration</option>
+                    {CORRECTION_DURATION_OPTIONS.map((option) => (
+                      <option key={option.label} value={option.quarterNotes}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" style={styles.secondaryButton} onClick={handleApplyNoteCorrection}>
+                    Apply
+                  </button>
+                </div>
+                <p style={styles.diagnosticHint}>
+                  Fixes what OMR misread on a single note (pitch and/or duration) — not a full notation editor. Pick the
+                  note, enter what it should be, and leave the other field blank to keep it as-is.
+                </p>
+                {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
+              </details>
+            ) : null}
           </details>
 
           {importState === "error" && importError ? <div style={styles.errorBox}>{importError}</div> : null}
@@ -1581,7 +1622,7 @@ export default function App(): ReactElement {
                     .map((issue) => `bar ${issue.measureNumber} (${issue.kind === "empty" ? "empty" : issue.kind === "short" ? "too short" : "too long"})`)
                     .join(", ")}
                   {importResult.score.measureIssues.length > 10 ? ", …" : ""}. Following can stall there: fix the note with
-                  "Fix a misread note" below, or use "Jump to bar" during practice to skip past it.
+                  "Fix a misread note" (under "Sheet music" above), or during practice tap the note you're on to jump past it.
                 </p>
               ) : null}
 
@@ -1617,46 +1658,6 @@ export default function App(): ReactElement {
                 )}
               </div>
 
-              {practiceMode === "off" && correctableNotes.length > 0 ? (
-                <details style={styles.correctionPanel}>
-                  <summary style={styles.foldSummary}>Fix a misread note</summary>
-                  <div style={styles.correctionRow}>
-                    <select
-                      value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
-                      onChange={(event) => setCorrectionNoteKey(event.target.value)}
-                    >
-                      {correctableNotes.map(({ measureIndex, noteIndex, note }) => (
-                        <option key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
-                          Measure {measureIndex + 1}, note {noteIndex + 1} — currently {note.pitch}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      placeholder="Corrected pitch (e.g. C#4)"
-                      value={correctionPitchInput}
-                      onChange={(event) => setCorrectionPitchInput(event.target.value)}
-                      style={{ width: "10em" }}
-                    />
-                    <select value={correctionDurationInput} onChange={(event) => setCorrectionDurationInput(event.target.value)}>
-                      <option value="">Don't change duration</option>
-                      {CORRECTION_DURATION_OPTIONS.map((option) => (
-                        <option key={option.label} value={option.quarterNotes}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button type="button" style={styles.secondaryButton} onClick={handleApplyNoteCorrection}>
-                      Apply
-                    </button>
-                  </div>
-                  <p style={styles.diagnosticHint}>
-                    Fixes what OMR misread on a single note (pitch and/or duration) — not a full notation editor. Pick the
-                    note, enter what it should be, and leave the other field blank to keep it as-is.
-                  </p>
-                  {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
-                </details>
-              ) : null}
 
               {practiceMode === "off" ? (
                 <div style={styles.diagnosticHint}>
