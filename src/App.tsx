@@ -35,6 +35,12 @@ const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
   { id: "practice", label: "Practice" }
 ];
 const TAB_STORAGE_KEY = "tunerapp.activeTab";
+const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
+// Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
+// leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
+// next line is visible below it).
+const AUTO_SCROLL_BAND: readonly [number, number] = [0.12, 0.7];
+const AUTO_SCROLL_TARGET = 0.3;
 
 const LIVE_CAPTURE_OPTIONS: StartCaptureOptions = {
   frameSize: 2048,
@@ -220,6 +226,34 @@ export default function App(): ReactElement {
     }
   }
 
+  // The upload controls fold away once a score is loaded (open while there's none).
+  const [uploadOpen, setUploadOpen] = useState(true);
+  useEffect(() => {
+    if (importState === "success") {
+      setUploadOpen(false);
+    } else if (importState === "idle" || importState === "error") {
+      setUploadOpen(true);
+    }
+  }, [importState]);
+
+  // Keep the cursor in view while practising (remembered per browser, on by default).
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(AUTO_SCROLL_STORAGE_KEY) !== "off";
+    } catch {
+      return true;
+    }
+  });
+
+  function handleAutoScrollChange(enabled: boolean): void {
+    setAutoScrollEnabled(enabled);
+    try {
+      window.localStorage.setItem(AUTO_SCROLL_STORAGE_KEY, enabled ? "on" : "off");
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
+  }
+
   // OMR/import correction panel (score/correctionUI/noteXmlCorrection.ts) -- "measureIndex:noteIndex"
   // keying a single ScoreNote (see that file's header comment for why notes are addressed this
   // way instead of by ScoreNote.id). Pitch/duration inputs represent "change to" and are left
@@ -262,6 +296,33 @@ export default function App(): ReactElement {
   // follower actually starting -- see handleStartPracticing()'s count-in handling below. Listening
   // mode never enters this state; it goes straight from "off" to "active".
   const [practiceMode, setPracticeMode] = useState<"off" | "counting_in" | "active">("off");
+
+  // Follow the cursor down the page while practising. Done here rather than with OSMD's own
+  // followCursor option because ScoreCursor also walks the OSMD cursor internally (quarter index,
+  // look-ahead), and followCursor would scroll the page on every one of those steps. Only scrolls
+  // when the cursor leaves AUTO_SCROLL_BAND, so it doesn't fight a player who scrolls by hand.
+  const followedStepIndex = followerState?.current?.stepIndex ?? null;
+  useEffect(() => {
+    if (!autoScrollEnabled || practiceMode !== "active" || followedStepIndex === null) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const cursorElement = scoreContainerRef.current?.querySelector<HTMLElement>('img[id^="cursorImg"]');
+      if (!cursorElement || cursorElement.style.display === "none") {
+        return;
+      }
+      const rect = cursorElement.getBoundingClientRect();
+      if (rect.height === 0) {
+        return; // practice tab hidden
+      }
+      const viewportHeight = window.innerHeight;
+      const [bandTop, bandBottom] = AUTO_SCROLL_BAND;
+      if (rect.top < viewportHeight * bandTop || rect.bottom > viewportHeight * bandBottom) {
+        window.scrollBy({ top: rect.top - viewportHeight * AUTO_SCROLL_TARGET, behavior: "smooth" });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [autoScrollEnabled, practiceMode, followedStepIndex]);
   // Mirrors practiceMode for the click player's onCountInComplete callback, which fires
   // asynchronously (after a real-time delay) via a plain closure captured when the count-in
   // started -- by the time it fires, that closure's own view of practiceMode is stale (state
@@ -1361,40 +1422,39 @@ export default function App(): ReactElement {
 
         <section style={activeTab === "practice" ? styles.importCard : { ...styles.importCard, display: "none" }}>
           {captureState.error ? <div style={styles.errorBox}>Microphone: {captureState.error.message}</div> : null}
-          <div style={styles.topRow}>
-            <div>
-              <p style={styles.kicker}>Sheet music import</p>
-              <h2 style={styles.subtitle}>Upload a photo</h2>
+          <details open={uploadOpen} onToggle={(event) => setUploadOpen(event.currentTarget.open)} style={styles.fold}>
+            <summary style={styles.foldSummary}>
+              {importState === "success" && importResult ? `Sheet music: ${importResult.score.title}` : "Sheet music: upload a photo or MusicXML"}
+              {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating, marginLeft: 10 }}>Loading…</span> : null}
+            </summary>
+
+            <div style={styles.buttonRow}>
+              <label style={styles.secondaryButton}>
+                Choose sheet music photo
+                <input type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
+              </label>
+              <label style={styles.secondaryButton}>
+                Choose MusicXML file
+                <input
+                  type="file"
+                  accept=".xml,.musicxml,application/vnd.recordare.musicxml+xml,text/xml,application/xml"
+                  onChange={handleMusicXmlFileSelected}
+                  style={styles.hiddenFileInput}
+                />
+              </label>
             </div>
-            {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating }}>Parsing sheet…</span> : null}
-          </div>
 
-          <div style={styles.buttonRow}>
-            <label style={styles.secondaryButton}>
-              Choose sheet music photo
-              <input type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
-            </label>
-            <label style={styles.secondaryButton}>
-              Choose MusicXML file
+            <label style={styles.diagnosticHint}>
               <input
-                type="file"
-                accept=".xml,.musicxml,application/vnd.recordare.musicxml+xml,text/xml,application/xml"
-                onChange={handleMusicXmlFileSelected}
-                style={styles.hiddenFileInput}
-              />
+                type="checkbox"
+                checked={autoCorrectTimeSignatures}
+                onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
+              />{" "}
+              Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
+              signature -- usually a missed mid-piece meter change -- infer and insert a corrected
+              one for that bar, off by default; see score/timeSignatureInference.ts)
             </label>
-          </div>
-
-          <label style={styles.diagnosticHint}>
-            <input
-              type="checkbox"
-              checked={autoCorrectTimeSignatures}
-              onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
-            />{" "}
-            Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
-            signature -- usually a missed mid-piece meter change -- infer and insert a corrected
-            one for that bar, off by default; see score/timeSignatureInference.ts)
-          </label>
+          </details>
 
           {importState === "error" && importError ? <div style={styles.errorBox}>{importError}</div> : null}
 
@@ -1495,8 +1555,8 @@ export default function App(): ReactElement {
               </div>
 
               {practiceMode === "off" && correctableNotes.length > 0 ? (
-                <div style={styles.correctionPanel}>
-                  <p style={styles.metaLabel}>Fix a misread note</p>
+                <details style={styles.correctionPanel}>
+                  <summary style={styles.foldSummary}>Fix a misread note</summary>
                   <div style={styles.correctionRow}>
                     <select
                       value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
@@ -1532,7 +1592,7 @@ export default function App(): ReactElement {
                     note, enter what it should be, and leave the other field blank to keep it as-is.
                   </p>
                   {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
-                </div>
+                </details>
               ) : null}
 
               {practiceMode === "off" ? (
@@ -1567,6 +1627,15 @@ export default function App(): ReactElement {
                   </label>
                 </div>
               ) : null}
+
+              <label style={styles.diagnosticHint}>
+                <input
+                  type="checkbox"
+                  checked={autoScrollEnabled}
+                  onChange={(event) => handleAutoScrollChange(event.target.checked)}
+                />{" "}
+                Auto-scroll to follow the music
+              </label>
 
               {trackingMode === "matchmaker" && practiceMode === "off" && !spotNextPassPending ? (
                 <div style={{ ...styles.diagnosticHint, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
@@ -1990,8 +2059,8 @@ const styles: Record<string, CSSProperties> = {
   page: {
     minHeight: "100vh",
     display: "grid",
-    placeItems: "center",
-    padding: "24px"
+    placeItems: "start center",
+    padding: "12px"
   },
   shell: {
     width: "100%",
@@ -2000,18 +2069,18 @@ const styles: Record<string, CSSProperties> = {
   heroCard: {
     position: "relative",
     overflow: "hidden",
-    borderRadius: "28px",
+    borderRadius: "18px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
     boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "28px"
+    padding: "16px"
   },
   topRow: {
     display: "flex",
     justifyContent: "space-between",
-    gap: "16px",
+    gap: "10px",
     alignItems: "start",
-    marginBottom: "28px"
+    marginBottom: "14px"
   },
   kicker: {
     margin: 0,
@@ -2022,7 +2091,7 @@ const styles: Record<string, CSSProperties> = {
   },
   title: {
     margin: "8px 0 0",
-    fontSize: "clamp(2.4rem, 4vw, 4.25rem)",
+    fontSize: "clamp(1.5rem, 3vw, 2.2rem)",
     lineHeight: 1,
     letterSpacing: "-0.04em"
   },
@@ -2030,42 +2099,42 @@ const styles: Record<string, CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     borderRadius: "999px",
-    padding: "10px 14px",
-    fontSize: "13px",
+    padding: "6px 10px",
+    fontSize: "12px",
     fontWeight: 600,
     border: "1px solid rgba(255, 255, 255, 0.12)"
   },
   readoutGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: "16px"
+    gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+    gap: "10px"
   },
   diagnosticsGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: "16px",
-    marginTop: "16px"
+    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+    gap: "10px",
+    marginTop: "10px"
   },
   readoutCard: {
-    borderRadius: "20px",
-    padding: "18px",
+    borderRadius: "14px",
+    padding: "12px",
     background: "rgba(255, 255, 255, 0.03)",
     border: "1px solid rgba(255, 255, 255, 0.08)",
-    minHeight: "122px",
+    minHeight: "84px",
     display: "flex",
     flexDirection: "column",
     justifyContent: "space-between"
   },
   diagnosticCard: {
-    borderRadius: "20px",
-    padding: "18px",
+    borderRadius: "14px",
+    padding: "12px",
     background: "rgba(255, 255, 255, 0.03)",
     border: "1px solid rgba(255, 255, 255, 0.08)",
-    minHeight: "138px",
+    minHeight: "90px",
     display: "flex",
     flexDirection: "column",
     justifyContent: "space-between",
-    gap: "10px"
+    gap: "6px"
   },
   readoutLabel: {
     color: "rgba(204, 214, 232, 0.7)",
@@ -2074,12 +2143,12 @@ const styles: Record<string, CSSProperties> = {
     textTransform: "uppercase"
   },
   readoutValueLarge: {
-    fontSize: "clamp(2.2rem, 6vw, 4.6rem)",
+    fontSize: "clamp(1.6rem, 4vw, 2.8rem)",
     fontWeight: 700,
     letterSpacing: "-0.05em"
   },
   readoutValue: {
-    fontSize: "clamp(1.15rem, 2.3vw, 1.6rem)",
+    fontSize: "clamp(1rem, 2vw, 1.3rem)",
     fontWeight: 600,
     letterSpacing: "-0.03em"
   },
@@ -2104,9 +2173,9 @@ const styles: Record<string, CSSProperties> = {
   metaRow: {
     display: "grid",
     gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: "12px",
-    marginTop: "18px",
-    padding: "18px 0 4px"
+    gap: "10px",
+    marginTop: "10px",
+    padding: "8px 0 2px"
   },
   metaLabel: {
     color: "rgba(204, 214, 232, 0.66)",
@@ -2115,15 +2184,15 @@ const styles: Record<string, CSSProperties> = {
     letterSpacing: "0.08em"
   },
   metaValue: {
-    marginTop: "6px",
-    fontSize: "15px",
+    marginTop: "4px",
+    fontSize: "14px",
     fontWeight: 600
   },
   deviceLabel: {
     display: "flex",
     flexDirection: "column",
     gap: "8px",
-    marginTop: "18px",
+    marginTop: "12px",
     color: "rgba(204, 214, 232, 0.7)",
     fontSize: "12px",
     textTransform: "uppercase",
@@ -2135,8 +2204,8 @@ const styles: Record<string, CSSProperties> = {
     textTransform: "none",
     letterSpacing: "normal",
     fontSize: "14px",
-    padding: "10px 12px",
-    borderRadius: "12px",
+    padding: "6px 10px",
+    borderRadius: "8px",
     background: "rgba(255, 255, 255, 0.04)",
     border: "1px solid rgba(255, 255, 255, 0.14)",
     color: "#f5f7fb"
@@ -2144,13 +2213,14 @@ const styles: Record<string, CSSProperties> = {
   buttonRow: {
     display: "flex",
     flexWrap: "wrap",
-    gap: "12px",
-    marginTop: "24px"
+    gap: "8px",
+    marginTop: "12px"
   },
   primaryButton: {
     border: "none",
     borderRadius: "999px",
-    padding: "14px 20px",
+    padding: "8px 14px",
+    fontSize: "14px",
     background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
     color: "#06111d",
     fontWeight: 700,
@@ -2159,22 +2229,23 @@ const styles: Record<string, CSSProperties> = {
   secondaryButton: {
     border: "1px solid rgba(255, 255, 255, 0.14)",
     borderRadius: "999px",
-    padding: "14px 20px",
+    padding: "8px 14px",
+    fontSize: "14px",
     background: "rgba(255, 255, 255, 0.04)",
     color: "#f5f7fb",
     fontWeight: 600,
     cursor: "pointer"
   },
   errorBox: {
-    marginTop: "18px",
-    padding: "14px 16px",
-    borderRadius: "16px",
+    marginTop: "10px",
+    padding: "8px 12px",
+    borderRadius: "10px",
     background: "rgba(255, 77, 77, 0.12)",
     border: "1px solid rgba(255, 77, 77, 0.24)",
     color: "#ffd0d0"
   },
   caption: {
-    margin: "20px 0 0",
+    margin: "12px 0 0",
     color: "rgba(204, 214, 232, 0.68)",
     lineHeight: 1.55,
     maxWidth: "68ch"
@@ -2182,21 +2253,22 @@ const styles: Record<string, CSSProperties> = {
   importCard: {
     position: "relative",
     overflow: "hidden",
-    borderRadius: "28px",
+    borderRadius: "18px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
     boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "28px"
+    padding: "16px"
   },
   tabBar: {
     display: "flex",
-    gap: "10px",
-    marginBottom: "18px"
+    gap: "8px",
+    marginBottom: "10px"
   },
   tab: {
     border: "1px solid rgba(255, 255, 255, 0.14)",
     borderRadius: "999px",
-    padding: "12px 24px",
+    padding: "7px 18px",
+    fontSize: "14px",
     background: "rgba(255, 255, 255, 0.04)",
     color: "#f5f7fb",
     fontWeight: 600,
@@ -2210,7 +2282,7 @@ const styles: Record<string, CSSProperties> = {
   },
   subtitle: {
     margin: "8px 0 0",
-    fontSize: "clamp(1.4rem, 2.4vw, 2rem)",
+    fontSize: "clamp(1.05rem, 2vw, 1.3rem)",
     letterSpacing: "-0.03em"
   },
   hiddenFileInput: {
@@ -2225,12 +2297,12 @@ const styles: Record<string, CSSProperties> = {
     border: 0
   },
   importResult: {
-    marginTop: "18px"
+    marginTop: "8px"
   },
   correctionPanel: {
-    marginTop: "18px",
-    padding: "16px",
-    borderRadius: "16px",
+    marginTop: "10px",
+    padding: "8px 12px",
+    borderRadius: "10px",
     background: "rgba(255, 255, 255, 0.03)",
     border: "1px solid rgba(255, 255, 255, 0.08)"
   },
@@ -2241,10 +2313,20 @@ const styles: Record<string, CSSProperties> = {
     alignItems: "center",
     marginTop: "8px"
   },
+  fold: {
+    marginTop: "4px"
+  },
+  foldSummary: {
+    cursor: "pointer",
+    fontSize: "14px",
+    fontWeight: 600,
+    color: "#c8d3e3",
+    padding: "4px 0"
+  },
   scoreContainer: {
     background: "#f7f4ee",
-    borderRadius: "16px",
-    padding: "16px",
+    borderRadius: "10px",
+    padding: "6px",
     overflowX: "auto"
   }
 };
