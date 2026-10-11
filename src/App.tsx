@@ -1,4 +1,4 @@
-import type { ChangeEvent, CSSProperties, ReactElement } from "react";
+import type { ChangeEvent, CSSProperties, MouseEvent, ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import {
   createMicrophoneCaptureController,
@@ -9,7 +9,7 @@ import {
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
-import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight } from "../score/renderer";
+import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight, type StartMarkerBox } from "../score/renderer";
 import type { CursorNoteInfo, QuarterIndexEntry } from "../score/renderer/scoreCursor";
 import { ScoreFollower, DEFAULT_SCORE_FOLLOWER_CONFIG, type ScoreFollowerState } from "../practice/cursor";
 import { MetronomeScoreFollower, DEFAULT_METRONOME_FOLLOWER_CONFIG } from "../practice/metronomeFollower";
@@ -339,6 +339,56 @@ export default function App(): ReactElement {
   // running in the Python server. All three coexist so they can be compared against real playing --
   // the first has never been reliable live, and the third is new and unproven.
   const [trackingMode, setTrackingMode] = useState<"listening" | "metronome" | "matchmaker">("matchmaker");
+
+  // "Start here": click a note on the score (while not practising) to start the next Matchmaker
+  // take from it -- the same seek "Jump to bar" makes, sent before any audio. Clicking the first
+  // note clears it. sessionStartRegion is what the running/last take actually used, so the summary
+  // and the colours cover only the notes from the start onwards.
+  const [startPoint, setStartPoint] = useState<{ quarter: number; stepIndex: number } | null>(null);
+  const [startMarker, setStartMarker] = useState<StartMarkerBox | null>(null);
+  const [sessionStartRegion, setSessionStartRegion] = useState<SpotRegion | null>(null);
+  useEffect(() => {
+    setStartPoint(null);
+  }, [scoreCursor]);
+  useEffect(() => {
+    if (!startPoint || !scoreCursor) {
+      setStartMarker(null);
+      return;
+    }
+    const refresh = () => setStartMarker(renderedScoreRef.current?.markerAt(startPoint.quarter) ?? null);
+    // OSMD's own resize re-render is debounced; measure after it settles (same as the bar boxes).
+    let timer = window.setTimeout(refresh, 50);
+    const onResize = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(refresh, 400);
+    };
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [startPoint, scoreCursor]);
+
+  function handleScoreClick(event: MouseEvent<HTMLDivElement>): void {
+    // Bar taps belong to spot practice while it's on; nothing moves mid-take.
+    if (spotEnabled || practiceMode !== "off" || !scoreCursor) {
+      return;
+    }
+    const hit = renderedScoreRef.current?.noteAt(event.clientX, event.clientY);
+    if (!hit) {
+      return;
+    }
+    // Snap to the first note that starts at or after the click, so a rest or a tied continuation
+    // starts the take from the next note actually played.
+    const entry = [...scoreCursor.buildQuarterIndex()]
+      .sort((a, b) => a.quarter - b.quarter)
+      .find((candidate) => candidate.quarter >= hit.quarter - 1e-6);
+    if (!entry || entry.stepIndex === 0) {
+      setStartPoint(null);
+      return;
+    }
+    setStartPoint({ quarter: entry.quarter, stepIndex: entry.stepIndex });
+  }
   const [matchmakerStatus, setMatchmakerStatus] = useState<MatchmakerStreamStatus>("idle");
   // Post-practice scoring: whether the server's alignment has arrived and local scoring begun (the
   // fallback timer stands down once it has), and how far along it is.
@@ -587,7 +637,7 @@ export default function App(): ReactElement {
   useEffect(() => {
     if (!scoreCursor || !followerState) return;
     if (followerState.status !== "completed" && followerState.status !== "stopped") return;
-    const summary = summarizePracticeSession(historyInRegion(followerState.history, activeSpotRegion), gradingOptions(gradeReference, gradeStrictness));
+    const summary = summarizePracticeSession(historyInRegion(followerState.history, activeSpotRegion ?? sessionStartRegion), gradingOptions(gradeReference, gradeStrictness));
     const highlights: NoteHighlight[] = [
       ...summary.unstableNoteIds.map((id) => ({ stepIndex: Number(id), color: OUT_OF_TUNE_HIGHLIGHT_COLOR })),
       ...summary.closeNoteIds.map((id) => ({ stepIndex: Number(id), color: CLOSE_HIGHLIGHT_COLOR })),
@@ -595,7 +645,7 @@ export default function App(): ReactElement {
       ...summary.unmeasuredNoteIds.map((id) => ({ stepIndex: Number(id), color: UNCLEAR_HIGHLIGHT_COLOR }))
     ];
     scoreCursor.highlightNotes(highlights);
-  }, [scoreCursor, followerState, gradeReference, gradeStrictness, activeSpotRegion]);
+  }, [scoreCursor, followerState, gradeReference, gradeStrictness, activeSpotRegion, sessionStartRegion]);
 
   // A Matchmaker take has ended and its post-practice alignment is on its way. However the follower
   // got here (End Practice, the server reporting the piece finished, the cursor running off the end
@@ -851,6 +901,20 @@ export default function App(): ReactElement {
       setSpotPasses([]);
       spotLoopingRef.current = false;
     }
+    // A note clicked as the start (a spot loop has its own first note and takes precedence).
+    const startEntry = !spotRegion && startPoint
+      ? scoreQuarterIndex.find((candidate) => Math.abs(candidate.quarter - startPoint.quarter) < 1e-6) ?? null
+      : null;
+    const startRegion: SpotRegion | null = startEntry
+      ? {
+          fromBar: 0,
+          toBar: 0,
+          firstStepIndex: startEntry.stepIndex,
+          lastStepIndex: Number.MAX_SAFE_INTEGER,
+          fromQuarter: startEntry.quarter
+        }
+      : null;
+    setSessionStartRegion(startRegion);
     let offlinePathReceived = false;
 
     const scoreOffline = async (path: AlignmentPoint[]): Promise<void> => {
@@ -966,6 +1030,10 @@ export default function App(): ReactElement {
       // any audio, so both the live follower and the post-take alignment start there.
       stream.seek(spotRegion.fromQuarter);
       followerRef.current.jumpToQuarter(spotRegion.fromQuarter);
+    } else if (startRegion && followerRef.current instanceof MatchmakerScoreFollower) {
+      // "Start here": the same jump, to the clicked note.
+      stream.seek(startRegion.fromQuarter);
+      followerRef.current.jumpToQuarter(startRegion.fromQuarter);
     }
   }
 
@@ -1027,6 +1095,9 @@ export default function App(): ReactElement {
       scoreCursor.highlightNotes([]);
     }
 
+    if (trackingMode !== "matchmaker") {
+      setSessionStartRegion(null); // "Start here" is a Matchmaker seek; other modes start at the top
+    }
     if (trackingMode === "matchmaker") {
       // Deferred like metronome mode's count-in, but waiting on the server preparing the score
       // rather than on a bar of clicks. sessionStartingRef stays set across the await so a second
@@ -1263,7 +1334,7 @@ export default function App(): ReactElement {
   const isInTune = liveCentsFromExpected !== null && Math.abs(liveCentsFromExpected) <= DEFAULT_SCORE_FOLLOWER_CONFIG.inTuneCentsThreshold;
   const intonationLabel = liveCentsFromExpected === null ? "Listening…" : isInTune ? "In tune" : "Off pitch";
   const intonationColor = liveCentsFromExpected === null ? "#f5f7fb" : isInTune ? "#8ee8cb" : "#ff8a8a";
-  const sessionSummary = summarizePracticeSession(historyInRegion(followerState?.history ?? [], activeSpotRegion), gradingOptions(gradeReference, gradeStrictness));
+  const sessionSummary = summarizePracticeSession(historyInRegion(followerState?.history ?? [], activeSpotRegion ?? sessionStartRegion), gradingOptions(gradeReference, gradeStrictness));
   // Read on render rather than mirrored into state: every change to it coincides with a follower
   // emit, which already re-renders.
   const finalScoringSource =
@@ -1637,6 +1708,22 @@ export default function App(): ReactElement {
                 Auto-scroll to follow the music
               </label>
 
+              {practiceMode === "off" && !spotEnabled && scoreCursor ? (
+                <div style={styles.diagnosticHint}>
+                  {startPoint && startMarker ? (
+                    <>
+                      Starts at bar {startMarker.barNumber} (▶ on the score) ·{" "}
+                      <button type="button" style={styles.linkButton} onClick={() => setStartPoint(null)}>
+                        Start from the beginning
+                      </button>
+                      {trackingMode !== "matchmaker" ? " · only used in Matchmaker mode" : ""}
+                    </>
+                  ) : (
+                    "Tip: tap a note on the score to start practising from there."
+                  )}
+                </div>
+              ) : null}
+
               {trackingMode === "matchmaker" && practiceMode === "off" && !spotNextPassPending ? (
                 <div style={{ ...styles.diagnosticHint, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
                   <label>
@@ -1883,8 +1970,29 @@ export default function App(): ReactElement {
 
               {renderError ? <div style={styles.errorBox}>Could not render this score: {renderError}</div> : null}
 
-              <div style={{ position: "relative", marginTop: 16 }}>
+              <div
+                style={{ position: "relative", marginTop: 16, cursor: !spotEnabled && practiceMode === "off" && scoreCursor ? "pointer" : "default" }}
+                onClick={handleScoreClick}
+              >
                 <div ref={scoreContainerRef} style={styles.scoreContainer} />
+                {startMarker && practiceMode === "off" ? (
+                  <div
+                    aria-label={`Practice starts at bar ${startMarker.barNumber}`}
+                    style={{
+                      position: "absolute",
+                      left: startMarker.left,
+                      top: startMarker.top,
+                      width: startMarker.width,
+                      height: startMarker.height,
+                      background: "rgba(76, 178, 255, 0.22)",
+                      borderLeft: "3px solid #2f8fff",
+                      borderRadius: 4,
+                      pointerEvents: "none"
+                    }}
+                  >
+                    <span style={styles.startMarkerLabel}>▶ Start</span>
+                  </div>
+                ) : null}
                 {measureBoxes.length > 0 ? (
                   <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }} aria-label="Bars to loop">
                     {measureBoxes.map((box) => {
@@ -2322,6 +2430,24 @@ const styles: Record<string, CSSProperties> = {
     fontWeight: 600,
     color: "#c8d3e3",
     padding: "4px 0"
+  },
+  linkButton: {
+    border: "none",
+    background: "none",
+    padding: 0,
+    font: "inherit",
+    color: "#8ee8cb",
+    textDecoration: "underline",
+    cursor: "pointer"
+  },
+  startMarkerLabel: {
+    position: "absolute",
+    top: "-17px",
+    left: "-3px",
+    fontSize: "11px",
+    fontWeight: 700,
+    color: "#2f8fff",
+    whiteSpace: "nowrap"
   },
   scoreContainer: {
     background: "#f7f4ee",
