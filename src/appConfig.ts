@@ -21,6 +21,9 @@ export interface AppConfig {
   // Scores offered in the "Score" dropdown of the Sheet music section (label + URL). The last one
   // chosen is remembered per browser and loaded instead of defaultScore on the next visit.
   scores: ScoreChoice[];
+  // Keep each finished take (audio, alignment, per-note results) on the server so a session can be
+  // checked afterwards (POST /api/takes/...; the server keeps the newest TAKES_KEEP).
+  archiveTakes: boolean;
   // Developer controls: the "auto-correct time signatures" import option and the listening-mode
   // tuning toggles.
   showDevOptions: boolean;
@@ -31,6 +34,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
   defaultTrackingMode: "matchmaker",
   defaultScore: "/scores/default.musicxml",
   scores: [],
+  archiveTakes: false,
   showDevOptions: false
 };
 
@@ -66,6 +70,9 @@ export function resolveAppConfig(raw: unknown): AppConfig {
         return record !== null && typeof record.label === "string" && typeof record.url === "string" && record.url !== "";
       })
       .map((entry) => ({ label: entry.label, url: entry.url }));
+  }
+  if (typeof source.archiveTakes === "boolean") {
+    config.archiveTakes = source.archiveTakes;
   }
   if (typeof source.showDevOptions === "boolean") {
     config.showDevOptions = source.showDevOptions;

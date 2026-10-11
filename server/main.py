@@ -14,13 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile, WebSocket
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 import xml.etree.ElementTree as ET
 
 import homr_runner
+import takes
 from position_manager import position_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -207,6 +208,45 @@ async def parse_sheet(file: UploadFile = File(...)) -> JSONResponse:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+@app.get("/api/takes")
+async def list_takes() -> JSONResponse:
+    """The archived takes, newest first -- see takes.py."""
+    return JSONResponse(content={"takes": takes.list_takes(), "keep": takes.TAKES_KEEP})
+
+
+@app.get("/api/takes/{take_id}/{name}")
+async def get_take_file(take_id: str, name: str):
+    path = takes.take_file(take_id, name)
+    if path is None:
+        return JSONResponse(status_code=404, content={"error": "No such take file."})
+    return FileResponse(path)
+
+
+@app.post("/api/takes/new")
+async def new_take() -> JSONResponse:
+    """A take id for a mode with no alignment session (metronome); audio is then uploaded in parts."""
+    return JSONResponse(content={"takeId": str(uuid.uuid4())})
+
+
+@app.post("/api/takes/{take_id}/audio")
+async def upload_take_audio(take_id: str, request: Request) -> JSONResponse:
+    part = await request.body()
+    if not takes.append_audio_part(take_id, part):
+        return JSONResponse(status_code=400, content={"error": "Bad take id."})
+    return JSONResponse(content={"ok": True, "bytes": len(part)})
+
+
+@app.post("/api/takes/{take_id}/result")
+async def finish_take(take_id: str, request: Request) -> JSONResponse:
+    result = await request.json()
+    if not isinstance(result, dict):
+        return JSONResponse(status_code=400, content={"error": "Expected a JSON object."})
+    folder = await asyncio.to_thread(takes.finish_take, take_id, result)
+    if folder is None:
+        return JSONResponse(status_code=400, content={"error": "Bad take id."})
+    return JSONResponse(content={"ok": True, "id": folder.name})
+
+
 @app.websocket("/ws/align")
 async def align(websocket: WebSocket) -> None:
     """Real-time score following: browser PCM in, quarter-note score positions out.
@@ -214,7 +254,7 @@ async def align(websocket: WebSocket) -> None:
     Protocol:
       client -> {"type": "config", "scoreHash": str, "scoreXml": str?, "sampleRate": int}
       server -> {"status": "need_score"}              (hash unknown here; resend config with XML)
-      server -> {"status": "ready", "hopLength": int, "totalQuarters": float}
+      server -> {"status": "ready", "hopLength": int, "totalQuarters": float, "sessionId": str}
       client -> binary float32 PCM, exactly hopLength samples per frame
       server -> {"status": "stream_started"}
       server -> {"quarter": float, "beat": float, "serverTs": float}   (only when it changes)
@@ -267,7 +307,7 @@ async def align(websocket: WebSocket) -> None:
         )
 
         await websocket.send_json(
-            {"status": "ready", "hopLength": aligner.hop_length, "totalQuarters": aligner.total_quarters}
+            {"status": "ready", "hopLength": aligner.hop_length, "totalQuarters": aligner.total_quarters, "sessionId": session_id}
         )
 
         position_event = position_manager.subscribe(session_id)
@@ -386,6 +426,14 @@ async def align(websocket: WebSocket) -> None:
                 await websocket.send_json(
                     {"type": "offlineAlignment", "path": [[t, q] for t, q in points]}
                 )
+            # Keep the take (audio + alignment) so the session can be checked afterwards; the
+            # browser adds its results under the same id once it has graded the take.
+            try:
+                await loop.run_in_executor(
+                    None, takes.save_session_audio, session_id, aligner.recorded_audio(), aligner.sample_rate, points
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Alignment session %s: could not archive the take", session_id[:8])
     except WebSocketDisconnect:
         logger.info("Alignment session %s disconnected", session_id[:8])
     except Exception as exc:  # noqa: BLE001

@@ -624,6 +624,12 @@ class LiveAligner:
         self._recorded_samples += len(payload) // 4
         self.data_queue.put(payload)
 
+    def recorded_audio(self) -> np.ndarray:
+        """Everything the browser sent this session, as float32 samples."""
+        if not self._recorded_chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(b"".join(self._recorded_chunks), dtype=np.float32)
+
     def quarter_to_ref_frame(self, quarter: float) -> int:
         part = self.score_part
         quarter = min(max(quarter, self.quarter_origin), self.total_quarters)

@@ -33,6 +33,9 @@ export interface MatchmakerStreamOptions {
   // that are part of playing -- a bow change, a note's decay tail, a breath between phrases -- so
   // only a genuine pause closes the gate. Default 400ms.
   gateHoldMs?: number;
+  // Record only: no alignment socket is opened, the worklet just retains the (level-gated) audio
+  // for the take archive. Used by metronome mode, which has no server session of its own.
+  recordOnly?: boolean;
 }
 
 export interface MatchmakerStreamDiagnostics {
@@ -51,6 +54,8 @@ export interface MatchmakerStreamDiagnostics {
   positionsReceived: number;
   hopLength: number | null;
   sampleRate: number | null;
+  // The server's id for this alignment session; the take archive files its results under it.
+  sessionId: string | null;
   totalQuarters: number | null;
   lastQuarter: number | null;
   lastLatencyMs: number | null;
@@ -74,6 +79,7 @@ interface ReadyMessage {
   status: "ready";
   hopLength: number;
   totalQuarters: number;
+  sessionId?: string;
 }
 
 function buildWorkletSource(): string {
@@ -154,6 +160,7 @@ export class MatchmakerStream {
     positionsReceived: 0,
     hopLength: null,
     sampleRate: null,
+    sessionId: null,
     totalQuarters: null,
     lastQuarter: null,
     lastLatencyMs: null,
@@ -191,6 +198,12 @@ export class MatchmakerStream {
     const audioContext = new AudioContext();
     this.audioContext = audioContext;
     this.diagnostics.sampleRate = audioContext.sampleRate;
+
+    if (options.recordOnly) {
+      await this.startAudio(audioContext, options, null, Math.max(1, Math.round(audioContext.sampleRate / 30)));
+      this.setStatus("streaming");
+      return;
+    }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${protocol}//${window.location.host}/ws/align`);
@@ -238,6 +251,7 @@ export class MatchmakerStream {
 
     this.diagnostics.hopLength = ready.hopLength;
     this.diagnostics.totalQuarters = ready.totalQuarters;
+    this.diagnostics.sessionId = ready.sessionId ?? null;
 
     // From here on the socket is in its steady state: the handshake handlers above are replaced by
     // the position stream.
@@ -256,14 +270,23 @@ export class MatchmakerStream {
       this.callbacks?.onClosed?.();
     };
 
+    await this.startAudio(audioContext, options, socket, ready.hopLength);
+  }
+
+  // Mic -> worklet -> (level gate) -> socket + the retained recording. Without a socket
+  // (recordOnly) the same pipeline just records, for the take archive.
+  private async startAudio(audioContext: AudioContext, options: MatchmakerStreamOptions, socket: WebSocket | null, hopLength: number): Promise<void> {
     this.workletModuleUrl = URL.createObjectURL(new Blob([buildWorkletSource()], { type: "application/javascript" }));
     await audioContext.audioWorklet.addModule(this.workletModuleUrl);
 
+    if (!this.clonedStream) {
+      return;
+    }
     this.sourceNode = audioContext.createMediaStreamSource(this.clonedStream);
     this.workletNode = new AudioWorkletNode(audioContext, WORKLET_NAME, {
       numberOfInputs: 1,
       numberOfOutputs: 0,
-      processorOptions: { hopLength: ready.hopLength }
+      processorOptions: { hopLength }
     });
 
     // Silence is never sent -- not before the first note, and not during a pause. Silence carries
@@ -278,11 +301,11 @@ export class MatchmakerStream {
     // side cooperates by starting alignment on the first chunk and disabling the library's
     // idle-queue timeouts, so a pause of any length is just a pause.
     const holdMs = options.gateHoldMs ?? 400;
-    const chunkMs = (ready.hopLength / audioContext.sampleRate) * 1000;
+    const chunkMs = (hopLength / audioContext.sampleRate) * 1000;
     let lastLoudAtMs = -Infinity;
     let sentMs = 0;
     this.workletNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
-      if (socket.readyState !== WebSocket.OPEN) {
+      if (socket && socket.readyState !== WebSocket.OPEN) {
         return;
       }
       sentMs += chunkMs;
@@ -300,7 +323,7 @@ export class MatchmakerStream {
         this.diagnostics.chunksDropped += 1;
         return;
       }
-      socket.send(event.data.buffer);
+      socket?.send(event.data.buffer);
       // Each posted chunk is its own buffer (the worklet slices), and WebSocket.send copies
       // rather than transferring, so retaining it here is safe.
       this.recordedChunks.push(event.data);
@@ -314,7 +337,9 @@ export class MatchmakerStream {
       await audioContext.resume();
     }
 
-    this.setStatus("waiting_for_sound");
+    if (socket) {
+      this.setStatus("waiting_for_sound");
+    }
   }
 
   // Hard teardown: abandon the session. Nothing further is delivered -- no completion, no offline

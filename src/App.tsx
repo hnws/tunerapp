@@ -26,7 +26,7 @@ import {
 import { MatchmakerStream, type MatchmakerStreamStatus } from "../audio/matchmakerStream";
 import { createBeatClock, computeTimeSignatureSegments, type BeatClock, type ClickSubdivision } from "../practice/metronome";
 import { DEFAULT_GRADING, STRICTNESS_BANDS, gradingOptions, summarizePracticeSession, type GradeReference, type GradeStrictness } from "../practice/reviewSummary";
-import { downloadTake, type SavedTake } from "../practice/takeExport";
+import { downloadTake, type SavedTake, uploadTake } from "../practice/takeExport";
 import { historyInRegion, passIsOver, resolveSpotRegion, summarizePass, type SpotPassResult, type SpotRegion } from "../practice/spotPractice";
 
 type ImportState = "idle" | "loading" | "success" | "error";
@@ -467,6 +467,11 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   // The most recent Matchmaker take, kept for "Download this take" (practice/takeExport.ts). The
   // history is filled in at download time from the follower's final state.
   const lastTakeRef = useRef<{ take: Omit<SavedTake, "history" | "scoringSource" | "savedAt">; audio: Float32Array } | null>(null);
+  // The stream of the current/last session, kept past teardown (its recording and diagnostics
+  // survive stop()) so the take archive can read them once the follower has finished.
+  const archiveStreamRef = useRef<MatchmakerStream | null>(null);
+  const archivedForRef = useRef<object | null>(null);
+  const [archivedTakeId, setArchivedTakeId] = useState<string | null>(null);
   const [takeAvailable, setTakeAvailable] = useState(false);
   const [offlineScoringProgress, setOfflineScoringProgress] = useState<number | null>(null);
   const [matchmakerError, setMatchmakerError] = useState<string | null>(null);
@@ -721,6 +726,74 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     setPracticeMode("off");
   }, [followerState, scoreCursor]);
 
+  // Take archive (config.archiveTakes): once a take has its final results, send them to the
+  // server. A Matchmaker take's audio is already there under the session id; a metronome take's
+  // recording goes up with them. Once per follower, however often the state re-emits.
+  useEffect(() => {
+    if (!config.archiveTakes || !followerState || !importResult) return;
+    if (followerState.status !== "completed" && followerState.status !== "stopped") return;
+    const follower = followerRef.current;
+    if (!follower || archivedForRef.current === follower) return;
+    const stream = archiveStreamRef.current;
+    const savedAt = new Date().toISOString();
+    const scoreTitle = importResult.score.title;
+    let take: SavedTake;
+    let audio: Float32Array | null = null;
+    let sessionId: string | null = null;
+    if (follower instanceof MatchmakerScoreFollower) {
+      const saved = lastTakeRef.current;
+      if (!saved) return;
+      sessionId = stream?.getDiagnostics().sessionId ?? null;
+      audio = sessionId ? null : saved.audio;
+      take = { ...saved.take, savedAt, history: followerState.history, scoringSource: follower.getScoringSource(), mode: "matchmaker", scoreTitle };
+    } else if (follower instanceof MetronomeScoreFollower) {
+      if (!stream) return;
+      const sampleRate = stream.getDiagnostics().sampleRate ?? 48_000;
+      audio = stream.getRecordedAudio();
+      if (audio.length < sampleRate) return; // under a second of sound: nothing to keep
+      take = {
+        format: "tunerapp-take",
+        version: 1,
+        savedAt,
+        sampleRate,
+        scoreXml: importResult.xmlData,
+        path: [],
+        notes: [],
+        quarterIndex: [],
+        detectorSetup: {
+          sampleRate,
+          gainScalar: captureState.gainScalar,
+          silenceRmsThreshold: captureState.silenceRmsThreshold,
+          frameSize: analysisFrameSizeFor(sampleRate, LIVE_CAPTURE_OPTIONS.frameSize ?? 2048),
+          hopSize: Math.round(sampleRate * OFFLINE_ANALYSIS_INTERVAL_SECONDS),
+          confidenceThreshold: LIVE_CAPTURE_OPTIONS.confidenceThreshold ?? 0.67,
+          lowCutHz: LIVE_CAPTURE_OPTIONS.lowCutHz ?? 80,
+          highCutHz: LIVE_CAPTURE_OPTIONS.highCutHz ?? 3500,
+          smoothingWindowFrames: OFFLINE_SMOOTHING_FRAMES
+        },
+        scoringConfig: {
+          inTuneCentsThreshold: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.inTuneCentsThreshold,
+          minSamplesForVerdict: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.minSamplesForVerdict,
+          settleMs: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.onsetSettleMs,
+          plausibilityHighConfidenceThreshold: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityHighConfidenceThreshold,
+          plausibilityLowConfidenceCentsLimit: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityLowConfidenceCentsLimit,
+          plausibilityAbsoluteCentsLimit: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityAbsoluteCentsLimit
+        },
+        history: followerState.history,
+        scoringSource: "live",
+        mode: "metronome",
+        bpm: metronomeBpm,
+        scoreTitle
+      };
+    } else {
+      return;
+    }
+    archivedForRef.current = follower;
+    uploadTake(take, audio, sessionId)
+      .then((id) => setArchivedTakeId(id))
+      .catch((error) => console.warn("The take wasn't archived", error));
+  }, [followerState, importResult, config.archiveTakes, captureState.gainScalar, captureState.silenceRmsThreshold, metronomeBpm]);
+
   // Session-end highlights: out of tune red, close amber, not played grey. Re-runs when the
   // grading reference changes, so switching "my tuning"/A440 recolours the score in place.
   useEffect(() => {
@@ -936,6 +1009,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
 
     const stream = new MatchmakerStream();
     matchmakerStreamRef.current = stream;
+    archiveStreamRef.current = stream;
+    setArchivedTakeId(null);
     setMatchmakerError(null);
     // Reuses metronome mode's pre-session state so the button becomes a cancel affordance while the
     // server prepares the score, rather than looking idle and clickable for several seconds.
@@ -1206,6 +1281,17 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     }
 
     setPracticeMode("counting_in");
+    setArchivedTakeId(null);
+    const recordingStream = controllerRef.current?.getMediaStream();
+    if (config.archiveTakes && recordingStream && importResult) {
+      // Metronome mode has no alignment session, so record the take here for the archive.
+      const recorder = new MatchmakerStream();
+      matchmakerStreamRef.current = recorder;
+      archiveStreamRef.current = recorder;
+      void recorder
+        .start(recordingStream, importResult.xmlData, { onPosition: () => undefined }, { silenceRmsThreshold: captureState.silenceRmsThreshold, recordOnly: true })
+        .catch((error) => console.warn("Take recording didn't start", error));
+    }
     const bpm = Math.min(300, Math.max(20, metronomeBpm || 90));
     // TEMPORARY diagnostic alongside the matching one in metronome.ts -- confirms the full
     // per-measure meter sequence the clock is actually working from, not just the piece's opening
@@ -2177,6 +2263,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                       Approximate: the full-recording analysis didn't finish, so this uses the live estimate.
                     </p>
                   ) : null}
+                  {archivedTakeId ? <p style={styles.diagnosticHint}>Saved on the server as take {archivedTakeId}.</p> : null}
                   {takeAvailable && lastTakeRef.current ? (
                     <div style={styles.buttonRow}>
                       <SlButton
