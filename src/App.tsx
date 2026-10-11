@@ -29,6 +29,13 @@ import { historyInRegion, passIsOver, resolveSpotRegion, summarizePass, type Spo
 
 type ImportState = "idle" | "loading" | "success" | "error";
 
+type AppTab = "tuner" | "practice";
+const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
+  { id: "tuner", label: "Tuner" },
+  { id: "practice", label: "Practice" }
+];
+const TAB_STORAGE_KEY = "tunerapp.activeTab";
+
 const LIVE_CAPTURE_OPTIONS: StartCaptureOptions = {
   frameSize: 2048,
   hopSize: 512,
@@ -147,10 +154,9 @@ export default function App(): ReactElement {
   // effect below depends on this).
   const [autoCorrectTimeSignatures, setAutoCorrectTimeSignatures] = useState(false);
 
-  // Load a default score on
-  // startup from /scores/default.musicxml if the deployment serves one (none there = start empty as
-  // before). ?score=<url> loads another one, ?score=none starts empty. Choosing a file afterwards
-  // replaces it as usual.
+  // Load a default score on startup from /scores/default.musicxml if the deployment serves one
+  // (none there = start empty as before). ?score=<url> loads another one, ?score=none starts empty.
+  // Choosing a file afterwards replaces it as usual.
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("score");
     if (param === "none") {
@@ -188,6 +194,31 @@ export default function App(): ReactElement {
       cancelled = true;
     };
   }, []);
+
+  // Two screens: the free tuner and score practice (default). Both sections stay mounted and are
+  // only hidden, so a running microphone or practice session survives switching tabs; the choice is
+  // remembered per browser.
+  const [activeTab, setActiveTab] = useState<AppTab>(() => {
+    try {
+      return window.localStorage.getItem(TAB_STORAGE_KEY) === "tuner" ? "tuner" : "practice";
+    } catch {
+      return "practice";
+    }
+  });
+
+  function selectTab(tab: AppTab): void {
+    setActiveTab(tab);
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {
+      // Storage unavailable (private mode): the tab just isn't remembered.
+    }
+    if (tab === "practice") {
+      // OSMD lays the score out against its container's width, which is 0 while the section is
+      // hidden; its autoResize listens for window resizes, so trigger one once the tab is shown.
+      window.requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    }
+  }
 
   // OMR/import correction panel (score/correctionUI/noteXmlCorrection.ts) -- "measureIndex:noteIndex"
   // keying a single ScoreNote (see that file's header comment for why notes are addressed this
@@ -1204,7 +1235,22 @@ export default function App(): ReactElement {
       `}</style>
 
       <main style={styles.shell}>
-        <section style={styles.heroCard}>
+        <nav style={styles.tabBar} role="tablist" aria-label="Screens">
+          {APP_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              style={activeTab === tab.id ? { ...styles.tab, ...styles.tabActive } : styles.tab}
+              onClick={() => selectTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
+        <section style={activeTab === "tuner" ? styles.heroCard : { ...styles.heroCard, display: "none" }}>
           <div style={styles.topRow}>
             <div>
               <p style={styles.kicker}>Live violin tuner</p>
@@ -1313,7 +1359,8 @@ export default function App(): ReactElement {
           </p>
         </section>
 
-        <section style={styles.importCard}>
+        <section style={activeTab === "practice" ? styles.importCard : { ...styles.importCard, display: "none" }}>
+          {captureState.error ? <div style={styles.errorBox}>Microphone: {captureState.error.message}</div> : null}
           <div style={styles.topRow}>
             <div>
               <p style={styles.kicker}>Sheet music import</p>
@@ -2139,8 +2186,27 @@ const styles: Record<string, CSSProperties> = {
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
     boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "28px",
-    marginTop: "24px"
+    padding: "28px"
+  },
+  tabBar: {
+    display: "flex",
+    gap: "10px",
+    marginBottom: "18px"
+  },
+  tab: {
+    border: "1px solid rgba(255, 255, 255, 0.14)",
+    borderRadius: "999px",
+    padding: "12px 24px",
+    background: "rgba(255, 255, 255, 0.04)",
+    color: "#f5f7fb",
+    fontWeight: 600,
+    cursor: "pointer"
+  },
+  tabActive: {
+    border: "1px solid transparent",
+    background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
+    color: "#06111d",
+    fontWeight: 700
   },
   subtitle: {
     margin: "8px 0 0",
