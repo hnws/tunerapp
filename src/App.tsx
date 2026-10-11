@@ -1,5 +1,5 @@
 import type { ChangeEvent, CSSProperties, MouseEvent, ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createMicrophoneCaptureController,
   type LiveCaptureState,
@@ -53,6 +53,8 @@ const TRACKING_MODE_DESCRIPTIONS: Record<TrackingModeId, string> = {
   listening: "Follows detected pitch and note starts in the browser (experimental)."
 };
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
+const SCORE_STORAGE_KEY = "tunerapp.scoreUrl";
+const OWN_FILE = "own-file"; // sl-option values can't be empty: stands for "a file you uploaded"
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
 // next line is visible below it).
@@ -186,48 +188,76 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   // effect below depends on this).
   const [autoCorrectTimeSignatures, setAutoCorrectTimeSignatures] = useState(false);
 
-  // Load the default score on startup (config.defaultScore, normally /scores/default.musicxml; ""
-  // or a missing file = start empty as before). ?score=<url> loads another one, ?score=none starts empty.
-  // Choosing a file afterwards replaces it as usual.
+  // Which entry of config.scores is loaded ("" once a file is uploaded instead). Remembered per
+  // browser, so the dropdown's choice comes back on the next visit instead of config.defaultScore.
+  const [scoreChoice, setScoreChoice] = useState<string>("");
+
+  const loadScoreFromUrl = useCallback(async (url: string, optional: boolean): Promise<void> => {
+    setImportState("loading");
+    try {
+      const response = await fetch(url);
+      if (!response.ok && optional) {
+        setImportState("idle");
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`Couldn't load the score at ${url} (HTTP ${response.status}).`);
+      }
+      const xmlData = await response.text();
+      const score = await importMusicXmlToScore(xmlData, { autoCorrectTimeSignatures: false });
+      setImportResult({ score, transientBoundingBoxes: [], xmlData });
+      setImportState("success");
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Couldn't load the score.");
+      setImportState("error");
+    }
+  }, []);
+
+  function forgetScoreChoice(): void {
+    setScoreChoice("");
+    try {
+      window.localStorage.removeItem(SCORE_STORAGE_KEY);
+    } catch {
+      // Storage unavailable.
+    }
+  }
+
+  function chooseScore(url: string): void {
+    setScoreChoice(url);
+    try {
+      window.localStorage.setItem(SCORE_STORAGE_KEY, url);
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
+    if (url) {
+      void loadScoreFromUrl(url, false);
+    }
+  }
+
+  // Load a score on startup: ?score=<url> wins (?score=none starts empty), then the dropdown
+  // choice remembered in this browser (if it's still offered), then config.defaultScore ("" or a
+  // missing file = start empty). Choosing a file afterwards replaces it as usual.
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("score");
     if (param === "none") {
       return;
     }
-    const url = param ?? config.defaultScore;
+    let remembered: string | null = null;
+    try {
+      remembered = window.localStorage.getItem(SCORE_STORAGE_KEY);
+    } catch {
+      remembered = null;
+    }
+    const offered = (url: string | null) => url !== null && config.scores.some((entry) => entry.url === url);
+    const url = param ?? (offered(remembered) ? remembered : config.defaultScore);
     if (!url) {
       return;
     }
-    let cancelled = false;
-    setImportState("loading");
-    (async () => {
-      try {
-        const response = await fetch(url);
-        if (!response.ok && param === null) {
-          if (!cancelled) {
-            setImportState("idle");
-          }
-          return;
-        }
-        if (!response.ok) {
-          throw new Error(`Couldn't load the score at ${url} (HTTP ${response.status}).`);
-        }
-        const xmlData = await response.text();
-        const score = await importMusicXmlToScore(xmlData, { autoCorrectTimeSignatures: false });
-        if (!cancelled) {
-          setImportResult({ score, transientBoundingBoxes: [], xmlData });
-          setImportState("success");
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setImportError(err instanceof Error ? err.message : "Couldn't load the default score.");
-          setImportState("error");
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    if (offered(url)) {
+      setScoreChoice(url);
+    }
+    void loadScoreFromUrl(url, param === null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Two screens: the free tuner and score practice (default). Both sections stay mounted and are
@@ -1288,6 +1318,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   }
 
   async function handleSheetFileSelected(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    forgetScoreChoice(); // the dropdown now shows "a file of your own"
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) {
@@ -1312,6 +1343,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   // Bypasses HOMR entirely -- useful for isolating the live tuner/score-following pipeline from
   // OMR pitch-recognition accuracy when testing.
   async function handleMusicXmlFileSelected(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    forgetScoreChoice(); // the dropdown now shows "a file of your own"
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) {
@@ -1604,6 +1636,29 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
               {importState === "success" && importResult ? `Sheet music: ${importResult.score.title}` : "Sheet music: upload a photo or MusicXML"}
               {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating, marginLeft: 10 }}>Loading…</span> : null}
             </div>
+
+            {config.scores.length > 0 ? (
+              <SlSelect
+                size="small"
+                label="Score"
+                hoist
+                className="score-select"
+                style={{ maxWidth: "32em", marginTop: 4 }}
+                value={scoreChoice || OWN_FILE}
+                disabled={practiceMode !== "off"}
+                onSlChange={(event) => {
+                  const url = eventValue(event);
+                  if (url !== OWN_FILE && url !== scoreChoice) chooseScore(url);
+                }}
+              >
+                {config.scores.map((entry) => (
+                  <SlOption key={entry.url} value={entry.url}>
+                    {entry.label}
+                  </SlOption>
+                ))}
+                <SlOption value={OWN_FILE}>A file of your own (below)</SlOption>
+              </SlSelect>
+            ) : null}
 
             <div style={styles.buttonRow}>
               <SlButton size="small" pill onClick={() => photoInputRef.current?.click()}>

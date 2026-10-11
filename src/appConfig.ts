@@ -5,6 +5,11 @@
 
 export type TrackingModeId = "matchmaker" | "metronome" | "listening";
 
+export interface ScoreChoice {
+  label: string;
+  url: string;
+}
+
 export interface AppConfig {
   // Tracking modes offered on the Practice tab, in display order. "listening" (practice/cursor.ts's
   // ScoreFollower) is kept in the code but was never reliable live, so it's off by default.
@@ -13,6 +18,9 @@ export interface AppConfig {
   defaultTrackingMode: TrackingModeId;
   // MusicXML loaded on startup; "" starts empty. ?score=<url> and ?score=none still override it.
   defaultScore: string;
+  // Scores offered in the "Score" dropdown of the Sheet music section (label + URL). The last one
+  // chosen is remembered per browser and loaded instead of defaultScore on the next visit.
+  scores: ScoreChoice[];
   // Developer controls: the "auto-correct time signatures" import option and the listening-mode
   // tuning toggles.
   showDevOptions: boolean;
@@ -22,6 +30,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
   trackingModes: ["matchmaker", "metronome"],
   defaultTrackingMode: "matchmaker",
   defaultScore: "/scores/default.musicxml",
+  scores: [],
   showDevOptions: false
 };
 
@@ -33,7 +42,7 @@ function isTrackingMode(value: unknown): value is TrackingModeId {
 
 export function resolveAppConfig(raw: unknown): AppConfig {
   const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const config: AppConfig = { ...DEFAULT_APP_CONFIG, trackingModes: [...DEFAULT_APP_CONFIG.trackingModes] };
+  const config: AppConfig = { ...DEFAULT_APP_CONFIG, trackingModes: [...DEFAULT_APP_CONFIG.trackingModes], scores: [] };
 
   if (Array.isArray(source.trackingModes)) {
     const modes = source.trackingModes.filter(isTrackingMode).filter((mode, index, all) => all.indexOf(mode) === index);
@@ -49,6 +58,14 @@ export function resolveAppConfig(raw: unknown): AppConfig {
   }
   if (typeof source.defaultScore === "string") {
     config.defaultScore = source.defaultScore;
+  }
+  if (Array.isArray(source.scores)) {
+    config.scores = source.scores
+      .filter((entry): entry is ScoreChoice => {
+        const record = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null;
+        return record !== null && typeof record.label === "string" && typeof record.url === "string" && record.url !== "";
+      })
+      .map((entry) => ({ label: entry.label, url: entry.url }));
   }
   if (typeof source.showDevOptions === "boolean") {
     config.showDevOptions = source.showDevOptions;
