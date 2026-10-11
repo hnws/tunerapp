@@ -291,7 +291,7 @@ export default function App(): ReactElement {
   const [jumpMessage, setJumpMessage] = useState<string | null>(null);
   const [scoreCursor, setScoreCursor] = useState<ScoreCursor | null>(null);
   const [followerState, setFollowerState] = useState<ScoreFollowerState | null>(null);
-  // "counting_in" is the metronome-mode-only gap between clicking "Practice this score" and the
+  // "counting_in" is the metronome-mode-only gap between clicking "Practice!" and the
   // follower actually starting -- see handleStartPracticing()'s count-in handling below. Listening
   // mode never enters this state; it goes straight from "off" to "active".
   const [practiceMode, setPracticeMode] = useState<"off" | "counting_in" | "active">("off");
@@ -483,7 +483,7 @@ export default function App(): ReactElement {
   // that opened it was low-confidence, so a fast run's weaker attacks are less likely to get cut
   // off before a stable reading lands.
   const [energyOnsetFusionEnabled, setEnergyOnsetFusionEnabled] = useState(true);
-  // Set by "Practice this score" when the mic isn't listening yet, so practicing can start
+  // Set by "Practice!" when the mic isn't listening yet, so practicing can start
   // automatically once calibration finishes instead of requiring a separate manual mic-start
   // step first. Cleared once it fires (or the mic start fails) so a later unrelated mic restart
   // doesn't unexpectedly auto-launch practice.
@@ -636,7 +636,7 @@ export default function App(): ReactElement {
     // changes after the session.
     // Back to "off" now that the session has actually ended (naturally or via End Practice) --
     // this is also what hides the live "Current note"/"Intonation" readout below (gated on
-    // practiceMode === "active") and swaps the button back to "Practice this score", so both
+    // practiceMode === "active") and swaps the button back to "Practice!", so both
     // need this, not just the button.
     setPracticeMode("off");
   }, [followerState, scoreCursor]);
@@ -1078,7 +1078,7 @@ export default function App(): ReactElement {
   }
 
   function handleStartPracticing(options: { keepHighlights?: boolean } = {}): void {
-    // Without this, clicking "Practice this score" more than once while a session is already
+    // Without this, clicking "Practice!" more than once while a session is already
     // counting in or active (e.g. a few impatient clicks before the button visibly swaps to
     // "Counting in… (cancel)") creates ANOTHER BeatClock -- its own AudioContext, setInterval
     // scheduler, and eventual MetronomeScoreFollower -- on top of the one already running, since
@@ -1525,6 +1525,11 @@ export default function App(): ReactElement {
                   style={styles.hiddenFileInput}
                 />
               </label>
+              {importState === "success" && importResult ? (
+                <button type="button" style={styles.secondaryButton} onClick={handleDownloadMusicXml}>
+                  Download MusicXML
+                </button>
+              ) : null}
             </div>
 
             <label style={styles.diagnosticHint}>
@@ -1581,9 +1586,6 @@ export default function App(): ReactElement {
               ) : null}
 
               <div style={styles.buttonRow}>
-                <button type="button" style={styles.secondaryButton} onClick={handleDownloadMusicXml}>
-                  Download MusicXML
-                </button>
                 {practiceMode === "active" ? (
                   <button
                     type="button"
@@ -1606,11 +1608,11 @@ export default function App(): ReactElement {
                 ) : (
                   <button
                     type="button"
-                    style={styles.secondaryButton}
+                    style={!scoreCursor || isStarting || pendingAutoStartPractice ? { ...styles.practiceButton, opacity: 0.5, cursor: "default" } : styles.practiceButton}
                     onClick={handleRequestStartPracticing}
                     disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
                   >
-                    {pendingAutoStartPractice || isStarting ? "Starting microphone…" : "Practice this score"}
+                    {pendingAutoStartPractice || isStarting ? "Starting microphone…" : "Practice!"}
                   </button>
                 )}
               </div>
@@ -2300,6 +2302,19 @@ const styles: Record<string, CSSProperties> = {
     background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
     color: "#06111d",
     fontWeight: 700,
+    cursor: "pointer"
+  },
+  // The one button to press on the Practice tab: a warm colour used nowhere else (the tabs and
+  // the tuner's buttons are teal/blue), a little larger.
+  practiceButton: {
+    border: "none",
+    borderRadius: "999px",
+    padding: "10px 30px",
+    background: "linear-gradient(135deg, #ffc24b 0%, #ff7a3d 100%)",
+    boxShadow: "0 6px 20px rgba(255, 122, 61, 0.4)",
+    color: "#06111d",
+    fontSize: "16px",
+    fontWeight: 800,
     cursor: "pointer"
   },
   secondaryButton: {
