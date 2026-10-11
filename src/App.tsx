@@ -46,6 +46,12 @@ const TRACKING_MODE_LABELS: Record<TrackingModeId, string> = {
   metronome: "Metronome (tempo-driven, no pitch tracking)",
   listening: "Listening (pitch/onset-driven)"
 };
+// The same modes, named briefly for the folded Settings header.
+const TRACKING_MODE_SHORT_LABELS: Record<TrackingModeId, string> = {
+  matchmaker: "Matchmaker",
+  metronome: "Metronome",
+  listening: "Listening"
+};
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
 const SETTINGS_OPEN_STORAGE_KEY = "tunerapp.settingsOpen";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
@@ -128,6 +134,12 @@ const UNCLEAR_HIGHLIGHT_COLOR = "#a07ee0";
 const SPOT_PASS_END_PAUSE_MS = 1200;
 const SPOT_NEXT_PASS_DELAY_MS = 1500;
 const OFFLINE_SCORING_TIMEOUT_MS = 15_000;
+
+// "+12¢", "-3¢", "0¢": rounded before the sign is chosen, so -0.4 doesn't print as "-0¢".
+function formatSignedCents(cents: number): string {
+  const rounded = Math.round(cents);
+  return `${rounded > 0 ? "+" : ""}${rounded === 0 ? 0 : rounded}¢`;
+}
 
 function statusLabel(status: LiveCaptureState["status"]): string {
   switch (status) {
@@ -1776,7 +1788,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   <strong>Settings</strong>
                   <span style={styles.foldSummaryHint}>
                     {" "}
-                    · {TRACKING_MODE_LABELS[trackingMode]}
+                    · {TRACKING_MODE_SHORT_LABELS[trackingMode]}
                     {trackingMode === "metronome" ? ` ${metronomeBpm} BPM` : ""} · auto-scroll {autoScrollEnabled ? "on" : "off"} ·{" "}
                     {gradeReference === "a440" ? "A440" : "own tuning"} · {STRICTNESS_BANDS[gradeStrictness].label}
                   </span>
@@ -2154,9 +2166,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   <div style={styles.diagnosticHint}>
                     Graded against{" "}
                     {gradeReference === "own" && sessionSummary.referenceSource !== "a440"
-                      ? `your own tuning (your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${
-                          sessionSummary.referenceCents >= 0 ? "+" : ""
-                        }${sessionSummary.referenceCents.toFixed(0)}¢ from A440)`
+                      ? `your own tuning (your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${formatSignedCents(sessionSummary.referenceCents)} from A440)`
                       : "A440"}
                     , {STRICTNESS_BANDS[gradeStrictness].label.toLowerCase()} (change in Settings):{" "}
                     <span style={{ color: "#8ee8cb" }}>green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
