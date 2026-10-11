@@ -35,6 +35,9 @@ const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
   { id: "practice", label: "Practice" }
 ];
 const TAB_STORAGE_KEY = "tunerapp.activeTab";
+// Listening mode (practice/cursor.ts's ScoreFollower) was never reliable live; its radio button
+// (and with it the listening-only dev toggles) is hidden. The code stays; flip this to bring it back.
+const SHOW_LISTENING_MODE = false;
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
@@ -1662,15 +1665,19 @@ export default function App(): ReactElement {
               {practiceMode === "off" ? (
                 <div style={styles.diagnosticHint}>
                   Tracking mode:{" "}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "listening"}
-                      onChange={() => setTrackingMode("listening")}
-                    />{" "}
-                    Listening (pitch/onset-driven)
-                  </label>{" "}
+                  {SHOW_LISTENING_MODE ? (
+                    <>
+                      <label>
+                        <input
+                          type="radio"
+                          name="trackingMode"
+                          checked={trackingMode === "listening"}
+                          onChange={() => setTrackingMode("listening")}
+                        />{" "}
+                        Listening (pitch/onset-driven)
+                      </label>{" "}
+                    </>
+                  ) : null}
                   <label>
                     <input
                       type="radio"
