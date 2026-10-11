@@ -7,6 +7,7 @@ import {
   type StartCaptureOptions
 } from "../audio/captureModule";
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
+import { DEFAULT_APP_CONFIG, type AppConfig, type TrackingModeId } from "./appConfig";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
 import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight, type StartMarkerBox } from "../score/renderer";
@@ -35,9 +36,12 @@ const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
   { id: "practice", label: "Practice" }
 ];
 const TAB_STORAGE_KEY = "tunerapp.activeTab";
-// Listening mode (practice/cursor.ts's ScoreFollower) was never reliable live; its radio button
-// (and with it the listening-only dev toggles) is hidden. The code stays; flip this to bring it back.
-const SHOW_LISTENING_MODE = false;
+// Labels for the tracking modes a deployment offers (config.trackingModes; see src/appConfig.ts).
+const TRACKING_MODE_LABELS: Record<TrackingModeId, string> = {
+  matchmaker: "Matchmaker (alignment server, recommended)",
+  metronome: "Metronome (tempo-driven, no pitch tracking)",
+  listening: "Listening (pitch/onset-driven)"
+};
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
@@ -138,7 +142,7 @@ function statusLabel(status: LiveCaptureState["status"]): string {
   }
 }
 
-export default function App(): ReactElement {
+export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfig }): ReactElement {
   const controllerRef = useRef<MicrophoneCaptureController | null>(null);
   if (!controllerRef.current) {
     controllerRef.current = createMicrophoneCaptureController();
@@ -163,15 +167,18 @@ export default function App(): ReactElement {
   // effect below depends on this).
   const [autoCorrectTimeSignatures, setAutoCorrectTimeSignatures] = useState(false);
 
-  // Load a default score on startup from /scores/default.musicxml if the deployment serves one
-  // (none there = start empty as before). ?score=<url> loads another one, ?score=none starts empty.
+  // Load the default score on startup (config.defaultScore, normally /scores/default.musicxml; ""
+  // or a missing file = start empty as before). ?score=<url> loads another one, ?score=none starts empty.
   // Choosing a file afterwards replaces it as usual.
   useEffect(() => {
     const param = new URLSearchParams(window.location.search).get("score");
     if (param === "none") {
       return;
     }
-    const url = param ?? "/scores/default.musicxml";
+    const url = param ?? config.defaultScore;
+    if (!url) {
+      return;
+    }
     let cancelled = false;
     setImportState("loading");
     (async () => {
@@ -340,7 +347,7 @@ export default function App(): ReactElement {
   // (practice/matchmakerFollower.ts) delegates the position decision to the Matchmaker library
   // running in the Python server. All three coexist so they can be compared against real playing --
   // the first has never been reliable live, and the third is new and unproven.
-  const [trackingMode, setTrackingMode] = useState<"listening" | "metronome" | "matchmaker">("matchmaker");
+  const [trackingMode, setTrackingMode] = useState<TrackingModeId>(config.defaultTrackingMode);
 
   // "Start here": click a note on the score (while not practising) to start the next Matchmaker
   // take from it -- the same seek a tap-to-jump makes, sent before any audio. Clicking the first
@@ -1535,16 +1542,18 @@ export default function App(): ReactElement {
               ) : null}
             </div>
 
-            <label style={styles.diagnosticHint}>
-              <input
-                type="checkbox"
-                checked={autoCorrectTimeSignatures}
-                onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
-              />{" "}
-              Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
-              signature -- usually a missed mid-piece meter change -- infer and insert a corrected
-              one for that bar, off by default; see score/timeSignatureInference.ts)
-            </label>
+            {config.showDevOptions ? (
+              <label style={styles.diagnosticHint}>
+                <input
+                  type="checkbox"
+                  checked={autoCorrectTimeSignatures}
+                  onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
+                />{" "}
+                Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
+                signature -- usually a missed mid-piece meter change -- infer and insert a corrected
+                one for that bar, off by default; see score/timeSignatureInference.ts)
+              </label>
+            ) : null}
 
             {practiceMode === "off" && correctableNotes.length > 0 ? (
               <details style={styles.correctionPanel}>
@@ -1665,37 +1674,17 @@ export default function App(): ReactElement {
               {practiceMode === "off" ? (
                 <div style={styles.diagnosticHint}>
                   Tracking mode:{" "}
-                  {SHOW_LISTENING_MODE ? (
-                    <>
-                      <label>
-                        <input
-                          type="radio"
-                          name="trackingMode"
-                          checked={trackingMode === "listening"}
-                          onChange={() => setTrackingMode("listening")}
-                        />{" "}
-                        Listening (pitch/onset-driven)
-                      </label>{" "}
-                    </>
-                  ) : null}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "matchmaker"}
-                      onChange={() => setTrackingMode("matchmaker")}
-                    />{" "}
-                    Matchmaker (alignment server, recommended)
-                  </label>{" "}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "metronome"}
-                      onChange={() => setTrackingMode("metronome")}
-                    />{" "}
-                    Metronome (tempo-driven, no pitch tracking)
-                  </label>
+                  {config.trackingModes.map((mode) => (
+                    <label key={mode} style={{ marginRight: 10 }}>
+                      <input
+                        type="radio"
+                        name="trackingMode"
+                        checked={trackingMode === mode}
+                        onChange={() => setTrackingMode(mode)}
+                      />{" "}
+                      {TRACKING_MODE_LABELS[mode]}
+                    </label>
+                  ))}
                 </div>
               ) : null}
 
@@ -1892,7 +1881,7 @@ export default function App(): ReactElement {
                 </label>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "listening" ? (
+              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
                 <label style={styles.diagnosticHint}>
                   <input
                     type="checkbox"
@@ -1904,7 +1893,7 @@ export default function App(): ReactElement {
                 </label>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
+              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
                 <label style={styles.diagnosticHint}>
                   Dev: max consecutive missed notes a resync can bridge{" "}
                   <input
@@ -1919,7 +1908,7 @@ export default function App(): ReactElement {
                 </label>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "listening" ? (
+              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
                 <label style={styles.diagnosticHint}>
                   <input
                     type="checkbox"
@@ -1931,7 +1920,7 @@ export default function App(): ReactElement {
                 </label>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "listening" ? (
+              {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
                 <label style={styles.diagnosticHint}>
                   <input
                     type="checkbox"

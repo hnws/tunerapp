@@ -1,0 +1,6 @@
+{
+  "trackingModes": ["matchmaker", "metronome"],
+  "defaultTrackingMode": "matchmaker",
+  "defaultScore": "/scores/default.musicxml",
+  "showDevOptions": false
+}
