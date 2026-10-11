@@ -483,6 +483,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     chunksSent: number;
     framesAccepted: number;
     framesRejected: number;
+    framesSpeech: number;
     positionsReceived: number;
     lastQuarter: number | null;
     stepIndex: number | null;
@@ -626,6 +627,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
         chunksSent: stream.chunksSent,
         framesAccepted: stream.framesAccepted,
         framesRejected: stream.framesRejected,
+        framesSpeech: stream.framesSpeech,
         positionsReceived: stream.positionsReceived,
         lastQuarter: stream.lastQuarter,
         stepIndex: follower?.stepIndex ?? null,
@@ -1982,7 +1984,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     <>
                       {" "}
                       · audio chunks sent {matchmakerLive.chunksSent} · matched the score {matchmakerLive.framesAccepted} · ignored as not-the-score{" "}
-                      {matchmakerLive.framesRejected} · positions received {matchmakerLive.positionsReceived}
+                      {matchmakerLive.framesRejected}
+                      {matchmakerLive.framesSpeech > 0 ? ` (${matchmakerLive.framesSpeech} as talking)` : ""} · positions received{" "}
+                      {matchmakerLive.positionsReceived}
                       {matchmakerLive.lastQuarter !== null ? ` · server position ${matchmakerLive.lastQuarter.toFixed(2)} qn` : ""}
                       {matchmakerLive.stepIndex !== null ? ` · cursor on note #${matchmakerLive.stepIndex + 1}` : ""}
                       {matchmakerLive.latencyMs !== null ? ` · ${Math.round(matchmakerLive.latencyMs)}ms` : ""}

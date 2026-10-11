@@ -307,8 +307,8 @@ async def align(websocket: WebSocket) -> None:
                         elif chunks % 15 == 0:
                             # ~2x/second: lets the page show that frames are being ignored as
                             # "not the piece", which otherwise looks identical to a stall.
-                            accepted, rejected = aligner.frame_stats()
-                            await websocket.send_json({"framesAccepted": accepted, "framesRejected": rejected})
+                            accepted, rejected, speech = aligner.frame_stats()
+                            await websocket.send_json({"framesAccepted": accepted, "framesRejected": rejected, "framesSpeech": speech})
                         continue
                     text = message.get("text")
                     if text:

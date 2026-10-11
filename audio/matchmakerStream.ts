@@ -46,6 +46,8 @@ export interface MatchmakerStreamDiagnostics {
   // nearby part of the score (noise, a wrong note) and is ignored so the position holds.
   framesAccepted: number;
   framesRejected: number;
+  // Of the rejected frames, those the server's speech detector called talking.
+  framesSpeech: number;
   positionsReceived: number;
   hopLength: number | null;
   sampleRate: number | null;
@@ -148,6 +150,7 @@ export class MatchmakerStream {
     chunksSent: 0,
     framesAccepted: 0,
     framesRejected: 0,
+    framesSpeech: 0,
     positionsReceived: 0,
     hopLength: null,
     sampleRate: null,
@@ -373,6 +376,7 @@ export class MatchmakerStream {
     if (typeof message.framesAccepted === "number") {
       this.diagnostics.framesAccepted = message.framesAccepted;
       this.diagnostics.framesRejected = message.framesRejected;
+      this.diagnostics.framesSpeech = typeof message.framesSpeech === "number" ? message.framesSpeech : 0;
       return;
     }
 
