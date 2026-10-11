@@ -54,6 +54,12 @@ const TRACKING_MODE_DESCRIPTIONS: Record<TrackingModeId, string> = {
 };
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
 const SCORE_STORAGE_KEY = "tunerapp.scoreUrl";
+// Live intonation readout smoothing (see the readout in App): median of up to this many readings
+// of the current note, shown once there are at least LIVE_READOUT_MIN_READINGS; beyond
+// LIVE_READOUT_BETWEEN_NOTES_CENTS the reading is a different note, not intonation.
+const LIVE_READOUT_WINDOW = 6;
+const LIVE_READOUT_MIN_READINGS = 3;
+const LIVE_READOUT_BETWEEN_NOTES_CENTS = 100;
 const OWN_FILE = "own-file"; // sl-option values can't be empty: stands for "a file you uploaded"
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
@@ -472,6 +478,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   const archiveStreamRef = useRef<MatchmakerStream | null>(null);
   const archivedForRef = useRef<object | null>(null);
   const [archivedTakeId, setArchivedTakeId] = useState<string | null>(null);
+  const liveReadingsRef = useRef<{ step: number | null; values: number[] }>({ step: null, values: [] });
+  const [liveIntonation, setLiveIntonation] = useState<number | null>(null);
   const [takeAvailable, setTakeAvailable] = useState(false);
   const [offlineScoringProgress, setOfflineScoringProgress] = useState<number | null>(null);
   const [matchmakerError, setMatchmakerError] = useState<string | null>(null);
@@ -1510,10 +1518,54 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   const pitchClass = captureState.isSilent ? "idle" : captureState.note ? "active" : "searching";
   const levelRatio = captureState.silenceRmsThreshold > 0 ? Math.min(1, captureState.rms / captureState.silenceRmsThreshold) : 0;
 
+  // Live intonation readout. The raw per-frame value compares the detected pitch with the note the
+  // live cursor is on at that instant, which in fast passages is often the neighbouring note (the
+  // live cursor lags or leads by a note), so it used to read "Off pitch" most of the time on
+  // correctly played notes (parent's report, 2026-10-11). Now: the median of the last few readings
+  // of the current note, judged with the Settings strictness band, and "Between notes" (not a
+  // verdict) when the reading is nowhere near the expected pitch. The final colours after the
+  // take come from the post-take alignment and were never affected.
   const liveCentsFromExpected = followerState?.liveCentsOffFromExpected ?? null;
-  const isInTune = liveCentsFromExpected !== null && Math.abs(liveCentsFromExpected) <= DEFAULT_SCORE_FOLLOWER_CONFIG.inTuneCentsThreshold;
-  const intonationLabel = liveCentsFromExpected === null ? "Listening…" : isInTune ? "In tune" : "Off pitch";
-  const intonationColor = liveCentsFromExpected === null ? "#f5f7fb" : isInTune ? "#8ee8cb" : "#ff8a8a";
+  const liveStepIndex = followerState?.current?.stepIndex ?? null;
+  useEffect(() => {
+    const readings = liveReadingsRef.current;
+    if (practiceMode !== "active") {
+      readings.step = null;
+      readings.values = [];
+      setLiveIntonation(null);
+      return;
+    }
+    if (readings.step !== liveStepIndex) {
+      readings.step = liveStepIndex;
+      readings.values = [];
+    }
+    if (liveCentsFromExpected === null) return;
+    readings.values.push(liveCentsFromExpected);
+    if (readings.values.length > LIVE_READOUT_WINDOW) readings.values.shift();
+    if (readings.values.length < LIVE_READOUT_MIN_READINGS) return;
+    const sorted = [...readings.values].sort((a, b) => a - b);
+    setLiveIntonation(sorted[Math.floor(sorted.length / 2)]);
+  }, [liveCentsFromExpected, liveStepIndex, practiceMode]);
+  const liveBand = STRICTNESS_BANDS[gradeStrictness];
+  const liveBetweenNotes = liveIntonation !== null && Math.abs(liveIntonation) > LIVE_READOUT_BETWEEN_NOTES_CENTS;
+  const intonationLabel =
+    liveIntonation === null
+      ? "Listening…"
+      : liveBetweenNotes
+        ? "Between notes"
+        : Math.abs(liveIntonation) <= liveBand.inTuneCents
+          ? "In tune"
+          : Math.abs(liveIntonation) <= liveBand.closeCents
+            ? "Close"
+            : "Off pitch";
+  const intonationColor =
+    liveIntonation === null || liveBetweenNotes
+      ? "#9aa0a6"
+      : Math.abs(liveIntonation) <= liveBand.inTuneCents
+        ? "#8ee8cb"
+        : Math.abs(liveIntonation) <= liveBand.closeCents
+          ? "#ffb020"
+          : "#ff8a8a";
   const sessionSummary = summarizePracticeSession(historyInRegion(followerState?.history ?? [], activeSpotRegion ?? sessionStartRegion), gradingOptions(gradeReference, gradeStrictness));
   // Read on render rather than mirrored into state: every change to it coincides with a follower
   // emit, which already re-renders.
@@ -2355,7 +2407,9 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   <div style={styles.readoutCard}>
                     <div style={styles.readoutLabel}>Intonation</div>
                     <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
-                    <div style={styles.diagnosticHint}>{formatCents(liveCentsFromExpected)} vs. expected</div>
+                    <div style={styles.diagnosticHint}>
+                      {liveBetweenNotes ? "cursor and note don't match yet" : liveIntonation === null ? "—" : `${formatCents(liveIntonation)} vs. expected`}
+                    </div>
                   </div>
                 </>
               ) : null}
