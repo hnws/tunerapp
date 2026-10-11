@@ -24,7 +24,7 @@ import {
   type AlignmentPoint
 } from "../practice/offlineIntonationScorer";
 import { MatchmakerStream, type MatchmakerStreamStatus } from "../audio/matchmakerStream";
-import { createBeatClock, computeTimeSignatureSegments, type BeatClock, type ClickSubdivision } from "../practice/metronome";
+import { createBeatClock, computeTimeSignatureSegments, resolveClickSubdivision, CLICK_SUBDIVISION_QUARTERS, type BeatClock, type ClickSubdivision } from "../practice/metronome";
 import { DEFAULT_GRADING, STRICTNESS_BANDS, gradingOptions, summarizePracticeSession, type GradeReference, type GradeStrictness } from "../practice/reviewSummary";
 import { downloadTake, type SavedTake, uploadTake } from "../practice/takeExport";
 import { historyInRegion, passIsOver, resolveSpotRegion, summarizePass, type SpotPassResult, type SpotRegion } from "../practice/spotPractice";
@@ -103,12 +103,20 @@ function formatCents(value: number | null): string {
   return `${rounded} cents`;
 }
 
-function formatTempo(value: number | null): string {
-  if (value === null) {
-    return "--";
-  }
+const TEMPO_UNIT_LABELS: Record<ClickSubdivision, string> = {
+  auto: "beat",
+  sixteenth: "16th",
+  eighth: "8th",
+  quarter: "quarter",
+  dottedQuarter: "dotted quarter"
+};
 
-  return `${value} BPM`;
+// The printed mark when there is one ("60 per 16th"), else the quarter-note BPM.
+function formatTempo(score: { tempoBpm: number | null; tempoMark?: { beatUnit: ClickSubdivision; perMinute: number } | null }): string {
+  if (score.tempoMark) {
+    return `${score.tempoMark.perMinute} per ${TEMPO_UNIT_LABELS[score.tempoMark.beatUnit]}`;
+  }
+  return score.tempoBpm === null ? "--" : `${score.tempoBpm} BPM`;
 }
 
 // Quarter-note-unit values, matching NOTE_TYPE_BY_QUARTER_NOTES in
@@ -648,11 +656,24 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     };
   }, [importState, importResult, autoCorrectTimeSignatures]);
 
+  // The score's tempo mark sets the clicks-per-minute AND the click unit (a sixteenth = 60
+  // exercise clicks once per note); a bare quarter-note tempo keeps the automatic unit.
   useEffect(() => {
-    if (importResult?.score.tempoBpm) {
+    if (importResult?.score.tempoMark) {
+      setMetronomeBpm(importResult.score.tempoMark.perMinute);
+      setClickSubdivision(importResult.score.tempoMark.beatUnit);
+    } else if (importResult?.score.tempoBpm) {
       setMetronomeBpm(importResult.score.tempoBpm);
+      setClickSubdivision("auto");
     }
   }, [importResult]);
+
+  // The Settings tempo in quarter notes per minute: what the alignment reference is rendered at.
+  function referenceQuarterBpm(): number {
+    const unit = resolveClickSubdivision(clickSubdivision, importResult?.score.timeSignature);
+    const bpm = Math.min(300, Math.max(20, metronomeBpm || 90));
+    return bpm * CLICK_SUBDIVISION_QUARTERS[unit];
+  }
 
   useEffect(() => {
     if (trackingMode !== "matchmaker" || practiceMode === "off") {
@@ -1185,7 +1206,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
       }, {
         // The capture module's calibrated noise-floor threshold, measured on the same raw signal
         // the alignment stream carries -- see MatchmakerStreamOptions.silenceRmsThreshold.
-        silenceRmsThreshold: captureState.silenceRmsThreshold
+        silenceRmsThreshold: captureState.silenceRmsThreshold,
+        referenceTempoBpm: referenceQuarterBpm()
       });
     } catch (error) {
       setMatchmakerError(error instanceof Error ? error.message : "Could not start alignment.");
@@ -1897,7 +1919,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 </div>
                 <div>
                   <div style={styles.metaLabel}>Tempo</div>
-                  <div style={styles.metaValue}>{formatTempo(importResult.score.tempoBpm)}</div>
+                  <div style={styles.metaValue}>{formatTempo(importResult.score)}</div>
                 </div>
                 <div>
                   <div style={styles.metaLabel}>Key / Time</div>
@@ -1950,12 +1972,16 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   ))}
                 </SlRadioGroup>
 
-                {trackingMode === "metronome" ? (
+                {trackingMode !== "listening" ? (
                   <SlInput
                     size="small"
                     type="number"
-                    label="Tempo (BPM)"
-                    helpText="The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
+                    label={`Tempo (clicks per minute, per ${TEMPO_UNIT_LABELS[clickSubdivision]})`}
+                    helpText={
+                      trackingMode === "metronome"
+                        ? "The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
+                        : "Roughly how fast you'll play: the follower's reference is rendered at this speed, which keeps it steadier on held notes."
+                    }
                     min={20}
                     max={300}
                     value={String(metronomeBpm)}
@@ -1996,10 +2022,10 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                   </SlCheckbox>
                 ) : null}
 
-                {trackingMode === "metronome" ? (
+                {trackingMode !== "listening" ? (
                   <SlSelect
                     size="small"
-                    label="Click subdivision"
+                    label="Click unit (what the tempo counts)"
                     hoist
                     style={{ maxWidth: "26em", marginTop: 8 }}
                     value={clickSubdivision}
@@ -2010,6 +2036,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     <SlOption value="quarter">Quarter note</SlOption>
                     <SlOption value="dottedQuarter">Dotted quarter (compound meter)</SlOption>
                     <SlOption value="eighth">Eighth note</SlOption>
+                    <SlOption value="sixteenth">Sixteenth note (one click per note in Schradieck)</SlOption>
                   </SlSelect>
                 ) : null}
 
@@ -2392,7 +2419,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
               {practiceMode === "off" ? (
                 <div style={styles.diagnosticHint}>
                   {TRACKING_MODE_SHORT_LABELS[trackingMode]}
-                  {trackingMode === "metronome" ? ` ${metronomeBpm} BPM` : ""} · {gradeReference === "a440" ? "A440" : "own tuning"} ·{" "}
+                  {` · ${metronomeBpm} per ${TEMPO_UNIT_LABELS[resolveClickSubdivision(clickSubdivision, importResult?.score.timeSignature)]}`} · {gradeReference === "a440" ? "A440" : "own tuning"} ·{" "}
                   {STRICTNESS_BANDS[gradeStrictness].label}
                 </div>
               ) : null}

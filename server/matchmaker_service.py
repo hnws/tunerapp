@@ -537,7 +537,7 @@ class _StreamingMatchmaker(Matchmaker):
         return np.asarray(self.score_part.beat_map(timeline), dtype=float)
 
     def preprocess_score(self):
-        cache_key = f"{self._cache_key}:{REFERENCE_SYNTH}"
+        cache_key = f"{self._cache_key}:{REFERENCE_SYNTH}:{self.tempo}"
         with _reference_cache_lock:
             cached = _reference_cache.get(cache_key)
             if cached is not None:

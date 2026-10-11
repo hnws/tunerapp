@@ -1,4 +1,5 @@
-import type { ScoreDocument, ScoreMeasure, ScoreMeasureIssue, ScoreNote } from "./schema";
+import type { ScoreDocument, ScoreMeasure, ScoreMeasureIssue, ScoreNote, TempoBeatUnit, TempoMark } from "./schema";
+import { TEMPO_BEAT_UNIT_QUARTERS } from "./schema";
 import { inferTimeSignature } from "./timeSignatureInference";
 
 const MAJOR_KEY_BY_FIFTHS: Record<number, string> = {
@@ -237,6 +238,7 @@ export async function importMusicXmlToScore(xml: string, options: MusicXmlImport
   let keySignature = "C";
   let timeSignature = "4/4";
   let tempoBpm: number | null = null;
+  let tempoMark: TempoMark | null = null;
   // What score/renderer/timeSignatureCorrection.ts would call "effective": the time signature a
   // MusicXML-sticky reader continues past this point given every genuine declaration AND every
   // correction applied so far, as opposed to `timeSignature` (only ever updated by a real
@@ -295,6 +297,22 @@ export async function importMusicXmlToScore(xml: string, options: MusicXmlImport
         const tempoAttr = child.querySelector("sound[tempo]")?.getAttribute("tempo");
         if (tempoAttr) {
           tempoBpm = Number.parseFloat(tempoAttr) || tempoBpm;
+        }
+        // The printed mark (<metronome>): kept as written, because the beat unit is what the
+        // player counts -- a sixteenth = 60 exercise is clicked once per note, not once per quarter.
+        const metronome = child.querySelector("metronome");
+        const unitText = metronome?.querySelector("beat-unit")?.textContent?.trim();
+        const perMinute = Number.parseFloat(metronome?.querySelector("per-minute")?.textContent ?? "");
+        if (metronome && unitText && Number.isFinite(perMinute) && perMinute > 0) {
+          const dotted = metronome.querySelector("beat-unit-dot") !== null;
+          const beatUnit: TempoBeatUnit | null =
+            unitText === "16th" ? "sixteenth" : unitText === "eighth" ? "eighth" : unitText === "quarter" ? (dotted ? "dottedQuarter" : "quarter") : null;
+          if (beatUnit) {
+            tempoMark = { beatUnit, perMinute };
+            if (!tempoAttr) {
+              tempoBpm = perMinute * TEMPO_BEAT_UNIT_QUARTERS[beatUnit];
+            }
+          }
         }
       }
 
@@ -423,6 +441,7 @@ export async function importMusicXmlToScore(xml: string, options: MusicXmlImport
     title,
     composer,
     tempoBpm: measures[0]?.tempoBpm ?? tempoBpm,
+    tempoMark,
     keySignature: measures[0]?.keySignature ?? keySignature,
     timeSignature: measures[0]?.timeSignature ?? timeSignature,
     sourceType: "musicxml",

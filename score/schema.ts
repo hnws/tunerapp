@@ -41,11 +41,30 @@ export interface ScoreMeasureIssue {
   expectedQuarterNotes: number;
 }
 
+export type TempoBeatUnit = "sixteenth" | "eighth" | "quarter" | "dottedQuarter";
+
+export interface TempoMark {
+  beatUnit: TempoBeatUnit;
+  perMinute: number;
+}
+
+// Quarter notes per beat unit.
+export const TEMPO_BEAT_UNIT_QUARTERS: Record<TempoBeatUnit, number> = {
+  sixteenth: 0.25,
+  eighth: 0.5,
+  quarter: 1,
+  dottedQuarter: 1.5
+};
+
 export interface ScoreDocument {
   title: string;
   composer: string;
   // null means no tempo was ever specified in the source, as opposed to a real authored value.
+  // Always in quarter notes per minute.
   tempoBpm: number | null;
+  // The printed metronome mark, when the source has one: its beat unit and the number per minute
+  // (e.g. a sixteenth = 60 for an exercise practised one click per note). null when absent.
+  tempoMark: TempoMark | null;
   keySignature: string;
   timeSignature: string;
   sourceType: SourceType;

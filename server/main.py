@@ -252,7 +252,7 @@ async def align(websocket: WebSocket) -> None:
     """Real-time score following: browser PCM in, quarter-note score positions out.
 
     Protocol:
-      client -> {"type": "config", "scoreHash": str, "scoreXml": str?, "sampleRate": int}
+      client -> {"type": "config", "scoreHash": str, "scoreXml": str?, "sampleRate": int, "tempo": float?}
       server -> {"status": "need_score"}              (hash unknown here; resend config with XML)
       server -> {"status": "ready", "hopLength": int, "totalQuarters": float, "sessionId": str}
       client -> binary float32 PCM, exactly hopLength samples per frame
@@ -287,6 +287,9 @@ async def align(websocket: WebSocket) -> None:
         score_hash = config.get("scoreHash")
         score_xml = config.get("scoreXml")
         sample_rate = int(config.get("sampleRate") or 48000)
+        # Reference tempo in quarter notes per minute (the app's Settings tempo); None = the score's.
+        tempo_raw = config.get("tempo")
+        tempo = float(tempo_raw) if isinstance(tempo_raw, (int, float)) and 5 <= float(tempo_raw) <= 400 else None
 
         score_path = matchmaker_service.has_cached_score(score_hash) if score_hash else None
         if score_path is None:
@@ -303,7 +306,7 @@ async def align(websocket: WebSocket) -> None:
         # Construction synthesizes the score with fluidsynth and extracts its reference features --
         # seconds of CPU work, so it must not block the event loop.
         aligner = await loop.run_in_executor(
-            alignment_executor, matchmaker_service.LiveAligner, score_path, score_hash, sample_rate
+            alignment_executor, matchmaker_service.LiveAligner, score_path, score_hash, sample_rate, tempo
         )
 
         await websocket.send_json(

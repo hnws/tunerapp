@@ -36,6 +36,9 @@ export interface MatchmakerStreamOptions {
   // Record only: no alignment socket is opened, the worklet just retains the (level-gated) audio
   // for the take archive. Used by metronome mode, which has no server session of its own.
   recordOnly?: boolean;
+  // Quarter notes per minute for the server's reference rendering; without it the score's own
+  // tempo is used. Closer to how the player actually plays = steadier tracking on held notes.
+  referenceTempoBpm?: number;
 }
 
 export interface MatchmakerStreamDiagnostics {
@@ -220,7 +223,8 @@ export class MatchmakerStream {
             type: "config",
             scoreHash,
             scoreXml,
-            sampleRate: audioContext.sampleRate
+            sampleRate: audioContext.sampleRate,
+            tempo: options.referenceTempoBpm ?? null
           })
         );
       };
@@ -231,7 +235,7 @@ export class MatchmakerStream {
       socket.onmessage = (event) => {
         const message = JSON.parse(String(event.data));
         if (message.status === "need_score") {
-          socket.send(JSON.stringify({ type: "config", scoreHash, scoreXml, sampleRate: audioContext.sampleRate }));
+          socket.send(JSON.stringify({ type: "config", scoreHash, scoreXml, sampleRate: audioContext.sampleRate, tempo: options.referenceTempoBpm ?? null }));
           return;
         }
         if (message.status === "ready") {
