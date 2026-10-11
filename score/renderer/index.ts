@@ -35,6 +35,9 @@ const QUARTER_EPSILON = 1e-6;
 
 export interface MeasureBox {
   measureIndex: number;
+  // The bar number printed on the sheet (differs from measureIndex + 1 when the file starts
+  // mid-piece or leaves bars out).
+  barNumber: number;
   left: number;
   top: number;
   width: number;
@@ -210,6 +213,7 @@ export async function renderScore(
         const bottom = Math.max(...shapes.map((b) => b.AbsolutePosition.y + b.BorderBottom)) + 2;
         boxes.push({
           measureIndex,
+          barNumber: staves.find((measure) => measure?.parentSourceMeasure)?.parentSourceMeasure.getPrintedMeasureNumber() ?? measureIndex + 1,
           left: offsetX + left * scale,
           top: offsetY + top * scale,
           width: (right - left) * scale,

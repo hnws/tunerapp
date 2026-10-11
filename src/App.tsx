@@ -268,7 +268,6 @@ export default function App(): ReactElement {
   const matchmakerStreamRef = useRef<MatchmakerStream | null>(null);
   // The current Matchmaker session's note list and quarter index, for "Jump to bar".
   const sessionNotesRef = useRef<{ notes: CursorNoteInfo[]; quarterIndex: QuarterIndexEntry[] } | null>(null);
-  const [jumpBarInput, setJumpBarInput] = useState("");
   // Spot practice (practice/spotPractice.ts): loop bars From-To, one graded pass at a time.
   const [spotEnabled, setSpotEnabled] = useState(false);
   const [spotFromInput, setSpotFromInput] = useState("");
@@ -370,12 +369,22 @@ export default function App(): ReactElement {
   }, [startPoint, scoreCursor]);
 
   function handleScoreClick(event: MouseEvent<HTMLDivElement>): void {
-    // Bar taps belong to spot practice while it's on; nothing moves mid-take.
-    if (spotEnabled || practiceMode !== "off" || !scoreCursor) {
+    // Bar taps belong to spot practice while it's on.
+    if (spotEnabled || !scoreCursor) {
       return;
     }
     const hit = renderedScoreRef.current?.noteAt(event.clientX, event.clientY);
     if (!hit) {
+      return;
+    }
+    // During a Matchmaker take a tap is a jump ("I'm here now"); otherwise it picks the start.
+    if (practiceMode === "active") {
+      if (trackingMode === "matchmaker" && followerState?.status === "in_progress") {
+        handleJumpToQuarter(hit.quarter);
+      }
+      return;
+    }
+    if (practiceMode !== "off") {
       return;
     }
     // Snap to the first note that starts at or after the click, so a rest or a tied continuation
@@ -740,6 +749,12 @@ export default function App(): ReactElement {
     };
   }, [showSpotBars, scoreCursor]);
 
+  // Bar numbers as printed on the sheet, for text: the spot-loop state counts bars in the file
+  // (1 = first bar in the file), which differs when the file starts mid-piece or skips bars.
+  function printedBar(fileBar: number): number {
+    return measureBoxes.find((box) => box.measureIndex === fileBar - 1)?.barNumber ?? fileBar;
+  }
+
   function handleSpotBarTap(measureIndex: number): void {
     const bar = measureIndex + 1;
     const from = Number.parseInt(spotFromInput, 10);
@@ -864,7 +879,6 @@ export default function App(): ReactElement {
       scoreNotes = scoreCursor.listNotes();
       scoreQuarterIndex = scoreCursor.buildQuarterIndex();
       sessionNotesRef.current = { notes: scoreNotes, quarterIndex: scoreQuarterIndex };
-      setJumpBarInput("");
       setJumpMessage(null);
     } catch (error) {
       console.error("Could not read the score's notes for score following", error);
@@ -1037,23 +1051,21 @@ export default function App(): ReactElement {
     }
   }
 
-  // "Jump to bar": when one bar stops tracking (often an OMR misread), the player moves on and
-  // tells the app where they are. The server aligns the take before and after the jump
-  // separately; notes jumped over are reported as not played.
-  function handleJumpToBar(): void {
+  // Jump during a take: when one bar stops tracking (often an OMR misread), the player taps the
+  // note they're on. The server aligns the take before and after the jump separately; notes
+  // jumped over are reported as not played.
+  function handleJumpToQuarter(quarter: number): void {
     const follower = followerRef.current;
     const stream = matchmakerStreamRef.current;
     const session = sessionNotesRef.current;
-    const bar = Number.parseInt(jumpBarInput, 10);
-    if (!(follower instanceof MatchmakerScoreFollower) || !stream || !session || !Number.isFinite(bar)) {
+    if (!(follower instanceof MatchmakerScoreFollower) || !stream || !session) {
       return;
     }
-    // The first note in that bar (or the first after it, if the bar has no notes of its own).
+    // The tapped note, or the next played note after a rest or tie continuation.
     const entry = [...session.quarterIndex]
       .sort((a, b) => a.quarter - b.quarter)
-      .find((candidate) => (session.notes[candidate.stepIndex]?.measureIndex ?? -1) + 1 >= bar);
+      .find((candidate) => candidate.quarter >= quarter - 1e-6);
     if (!entry) {
-      setJumpMessage(`There's no bar ${bar} with notes in this score.`);
       return;
     }
     if (!stream.seek(entry.quarter)) {
@@ -1061,8 +1073,8 @@ export default function App(): ReactElement {
       return;
     }
     follower.jumpToQuarter(entry.quarter);
-    const landedBar = (session.notes[entry.stepIndex]?.measureIndex ?? 0) + 1;
-    setJumpMessage(landedBar === bar ? `Jumped to bar ${bar}. Play from there.` : `Bar ${bar} has no notes; jumped to bar ${landedBar}.`);
+    const bar = renderedScoreRef.current?.markerAt(entry.quarter)?.barNumber;
+    setJumpMessage(bar ? `Jumped to bar ${bar}. Play from there.` : "Jumped. Play from there.");
   }
 
   function handleStartPracticing(options: { keepHighlights?: boolean } = {}): void {
@@ -1584,30 +1596,8 @@ export default function App(): ReactElement {
                     {activeSpotRegion ? "Stop looping" : "End Practice"}
                   </button>
                 ) : null}
-                {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" ? (
-                  <form
-                    style={{ display: "flex", gap: 8, alignItems: "center" }}
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      handleJumpToBar();
-                    }}
-                  >
-                    <label style={styles.diagnosticHint} htmlFor="jump-bar">
-                      Stuck? Jump to bar
-                    </label>
-                    <input
-                      id="jump-bar"
-                      type="number"
-                      min={1}
-                      inputMode="numeric"
-                      value={jumpBarInput}
-                      onChange={(event) => setJumpBarInput(event.target.value)}
-                      style={{ width: 64 }}
-                    />
-                    <button type="submit" style={styles.secondaryButton} disabled={!jumpBarInput}>
-                      Go
-                    </button>
-                  </form>
+                {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" && !spotEnabled ? (
+                  <span style={styles.diagnosticHint}>{jumpMessage ?? "Lost? Tap the note you're on to jump there."}</span>
                 ) : null}
                 {practiceMode === "active" ? null : practiceMode === "counting_in" ? (
                   <button type="button" style={styles.secondaryButton} onClick={handleCancelCountIn}>
@@ -1739,34 +1729,12 @@ export default function App(): ReactElement {
                   </label>
                   {spotEnabled ? (
                     <>
-                      <label>
-                        bars{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          aria-label="First bar to loop"
-                          value={spotFromInput}
-                          onChange={(event) => setSpotFromInput(event.target.value)}
-                          style={{ width: 56 }}
-                        />
-                      </label>
-                      <label>
-                        to{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          aria-label="Last bar to loop"
-                          value={spotToInput}
-                          onChange={(event) => setSpotToInput(event.target.value)}
-                          style={{ width: 56 }}
-                        />
-                      </label>
                       <span>
                         {spotAwaitingEnd
-                          ? "Tap the last bar to loop (or start now to loop just this bar)."
-                          : "Tap a bar on the score to start choosing, or type the bars."}{" "}
+                          ? `Bar ${printedBar(Number.parseInt(spotFromInput, 10))} picked: tap the last bar to loop (or start now to loop just this bar).`
+                          : spotFromInput && spotToInput
+                            ? `Looping bars ${printedBar(Number.parseInt(spotFromInput, 10))}–${printedBar(Number.parseInt(spotToInput, 10))}; tap a bar to choose again.`
+                            : "Tap the first bar to loop on the score."}{" "}
                         Each pass is graded when you play past the last bar or stop; the next one starts when you play again.
                       </span>
                     </>
@@ -1777,7 +1745,7 @@ export default function App(): ReactElement {
               {activeSpotRegion && (spotPasses.length > 0 || practiceMode !== "off" || spotNextPassPending) ? (
                 <div style={styles.diagnosticHint}>
                   <strong>
-                    Looping bars {activeSpotRegion.fromBar}–{activeSpotRegion.toBar}
+                    Looping bars {printedBar(activeSpotRegion.fromBar)}–{printedBar(activeSpotRegion.toBar)}
                     {practiceMode !== "off" ? ` · pass ${spotPasses.length + 1}` : ""}
                     {spotNextPassPending ? " · next pass starting…" : ""}
                   </strong>
@@ -1971,7 +1939,7 @@ export default function App(): ReactElement {
               {renderError ? <div style={styles.errorBox}>Could not render this score: {renderError}</div> : null}
 
               <div
-                style={{ position: "relative", marginTop: 16, cursor: !spotEnabled && practiceMode === "off" && scoreCursor ? "pointer" : "default" }}
+                style={{ position: "relative", marginTop: 16, cursor: !spotEnabled && scoreCursor && (practiceMode === "off" || (practiceMode === "active" && trackingMode === "matchmaker")) ? "pointer" : "default" }}
                 onClick={handleScoreClick}
               >
                 <div ref={scoreContainerRef} style={styles.scoreContainer} />
@@ -2004,7 +1972,7 @@ export default function App(): ReactElement {
                         <button
                           key={box.measureIndex}
                           type="button"
-                          aria-label={`Bar ${bar}`}
+                          aria-label={`Bar ${box.barNumber}`}
                           aria-pressed={selected}
                           disabled={!spotSelecting}
                           onClick={() => handleSpotBarTap(box.measureIndex)}
