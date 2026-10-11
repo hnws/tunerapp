@@ -6,6 +6,7 @@ import "@shoelace-style/shoelace/dist/themes/dark.css";
 export { default as SlButton } from "@shoelace-style/shoelace/dist/react/button/index.js";
 export { default as SlCheckbox } from "@shoelace-style/shoelace/dist/react/checkbox/index.js";
 export { default as SlDetails } from "@shoelace-style/shoelace/dist/react/details/index.js";
+export { default as SlDrawer } from "@shoelace-style/shoelace/dist/react/drawer/index.js";
 export { default as SlInput } from "@shoelace-style/shoelace/dist/react/input/index.js";
 export { default as SlOption } from "@shoelace-style/shoelace/dist/react/option/index.js";
 export { default as SlRadioButton } from "@shoelace-style/shoelace/dist/react/radio-button/index.js";

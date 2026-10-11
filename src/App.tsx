@@ -8,7 +8,7 @@ import {
 } from "../audio/captureModule";
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
 import { DEFAULT_APP_CONFIG, type AppConfig, type TrackingModeId } from "./appConfig";
-import { SlButton, SlCheckbox, SlDetails, SlInput, SlOption, SlRadioButton, SlRadioGroup, SlSelect, SlTab, SlTabGroup, eventChecked, eventValue, isOwnEvent } from "./ui";
+import { SlButton, SlCheckbox, SlDetails, SlDrawer, SlInput, SlOption, SlRadioButton, SlRadioGroup, SlSelect, SlTab, SlTabGroup, eventChecked, eventValue, isOwnEvent } from "./ui";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
 import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight, type StartMarkerBox } from "../score/renderer";
@@ -53,7 +53,6 @@ const TRACKING_MODE_SHORT_LABELS: Record<TrackingModeId, string> = {
   listening: "Listening"
 };
 const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
-const SETTINGS_OPEN_STORAGE_KEY = "tunerapp.settingsOpen";
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
 // next line is visible below it).
@@ -266,23 +265,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
     }
   }, [importState]);
 
-  // The Settings fold (tracking, auto-scroll, grading) starts folded; remembered per browser.
-  const [settingsOpen, setSettingsOpen] = useState<boolean>(() => {
-    try {
-      return window.localStorage.getItem(SETTINGS_OPEN_STORAGE_KEY) === "open";
-    } catch {
-      return false;
-    }
-  });
-
-  function handleSettingsOpenChange(open: boolean): void {
-    setSettingsOpen(open);
-    try {
-      window.localStorage.setItem(SETTINGS_OPEN_STORAGE_KEY, open ? "open" : "closed");
-    } catch {
-      // Storage unavailable: the fold just starts folded next time.
-    }
-  }
+  // The Settings drawer (tracking, auto-scroll, grading), opened from the gear next to Practice!.
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Keep the cursor in view while practising (remembered per browser, on by default).
   const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
@@ -1481,12 +1465,15 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
           font-weight: 800;
           box-shadow: 0 6px 20px rgba(255, 122, 61, 0.4);
         }
+        sl-drawer.settings-drawer {
+          --size: min(380px, 90vw);
+        }
         sl-button.practice-button[size="large"]::part(base) {
           padding: 0 14px;
         }
       `}</style>
 
-      <main style={styles.shell}>
+      <main style={activeTab === "practice" ? styles.shellWide : styles.shell}>
         <SlTabGroup className="app-tabs" onSlTabShow={(event) => selectTab(event.detail.name as AppTab)}>
           {APP_TABS.map((tab) => (
             <SlTab key={tab.id} slot="nav" panel={tab.id} active={activeTab === tab.id}>
@@ -1703,7 +1690,8 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
           {importState === "error" && importError ? <div style={styles.errorBox}>{importError}</div> : null}
 
           {importState === "success" && importResult ? (
-            <div style={styles.importResult}>
+            <div style={styles.practiceLayout}>
+            <div style={styles.practiceMain}>
               <div style={styles.metaRow}>
                 <div>
                   <div style={styles.metaLabel}>Title</div>
@@ -1741,59 +1729,16 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 </p>
               ) : null}
 
-              <div style={styles.buttonRow}>
-                {practiceMode === "active" ? (
-                  <SlButton
-                    size="small"
-                    pill
-                    onClick={() => {
-                      handleStopLooping();
-                      handleEndPracticing();
-                    }}
-                  >
-                    {activeSpotRegion ? "Stop looping" : "End Practice"}
-                  </SlButton>
-                ) : null}
-                {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" && !spotEnabled ? (
-                  <span style={styles.diagnosticHint}>{jumpMessage ?? "Lost? Tap the note you're on to jump there."}</span>
-                ) : null}
-                {practiceMode === "active" ? null : practiceMode === "counting_in" ? (
-                  <SlButton size="small" pill onClick={handleCancelCountIn}>
-                    {trackingMode === "matchmaker" ? "Preparing score… (cancel)" : "Counting in… (cancel)"}
-                  </SlButton>
-                ) : (
-                  <SlButton
-                    className="practice-button"
-                    variant="warning"
-                    size="large"
-                    pill
-                    onClick={handleRequestStartPracticing}
-                    disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
-                  >
-                    {pendingAutoStartPractice || isStarting ? "Starting microphone…" : "Practice!"}
-                  </SlButton>
-                )}
-              </div>
-
-
-              {/* Every practice setting in one fold. How a take is tracked can only change between
-                  takes; auto-scroll and grading apply at once (grading recolours the last take). */}
-              <SlDetails
-                className="fold settings-fold"
+              {/* Every practice setting, in a drawer opened by the gear next to Practice!. How a take is
+                  tracked can only change between takes; auto-scroll and grading apply at once (grading
+                  recolours the last take). */}
+              <SlDrawer
+                label="Settings"
+                placement="end"
+                className="settings-drawer"
                 open={settingsOpen}
-                onSlShow={(event) => isOwnEvent(event) && handleSettingsOpenChange(true)}
-                onSlHide={(event) => isOwnEvent(event) && handleSettingsOpenChange(false)}
+                onSlHide={(event) => isOwnEvent(event) && setSettingsOpen(false)}
               >
-                <div slot="summary">
-                  <strong>Settings</strong>
-                  <span style={styles.foldSummaryHint}>
-                    {" "}
-                    · {TRACKING_MODE_SHORT_LABELS[trackingMode]}
-                    {trackingMode === "metronome" ? ` ${metronomeBpm} BPM` : ""} · auto-scroll {autoScrollEnabled ? "on" : "off"} ·{" "}
-                    {gradeReference === "a440" ? "A440" : "own tuning"} · {STRICTNESS_BANDS[gradeStrictness].label}
-                  </span>
-                </div>
-
                 <SlRadioGroup
                   size="small"
                   label="Tracking"
@@ -1940,7 +1885,7 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     </SlRadioButton>
                   ))}
                 </SlRadioGroup>
-              </SlDetails>
+              </SlDrawer>
 
               {practiceMode === "off" && !spotEnabled && scoreCursor ? (
                 <div style={styles.diagnosticHint}>
@@ -2124,21 +2069,6 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 ) : null}
               </div>
 
-              {practiceMode === "active" && followerState?.current ? (
-                <div style={styles.readoutGrid}>
-                  <div style={styles.readoutCard}>
-                    <div style={styles.readoutLabel}>Current note</div>
-                    <div style={styles.readoutValueLarge}>{followerState.current.pitchLabel ?? "--"}</div>
-                    <div style={styles.diagnosticHint}>Measure {followerState.current.measureIndex + 1}</div>
-                  </div>
-                  <div style={styles.readoutCard}>
-                    <div style={styles.readoutLabel}>Intonation</div>
-                    <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
-                    <div style={styles.diagnosticHint}>{formatCents(liveCentsFromExpected)} vs. expected</div>
-                  </div>
-                </div>
-              ) : null}
-
               {followerState?.status === "scoring" ? (
                 <div style={styles.importResult}>
                   <p style={styles.diagnosticHint}>
@@ -2214,6 +2144,76 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                 </div>
               ) : null}
             </div>
+
+            {/* Practice controls and the live readout: a column beside the score that stays in view
+                while the page scrolls (position: sticky). Always present once a score is loaded, so
+                starting a take never changes the score's width (which would re-lay it out mid-take). */}
+            <aside style={styles.practiceSidebar} aria-label="Practice controls">
+              <div style={styles.sidebarButtons}>
+                {practiceMode === "active" ? (
+                  <SlButton
+                    className="end-button"
+                    variant="danger"
+                    size="large"
+                    pill
+                    style={{ flex: 1 }}
+                    onClick={() => {
+                      handleStopLooping();
+                      handleEndPracticing();
+                    }}
+                  >
+                    {activeSpotRegion ? "Stop looping" : "End Practice"}
+                  </SlButton>
+                ) : practiceMode === "counting_in" ? (
+                  <SlButton size="large" pill style={{ flex: 1 }} onClick={handleCancelCountIn}>
+                    {trackingMode === "matchmaker" ? "Preparing… (cancel)" : "Counting in… (cancel)"}
+                  </SlButton>
+                ) : (
+                  <SlButton
+                    className="practice-button"
+                    variant="warning"
+                    size="large"
+                    pill
+                    style={{ flex: 1 }}
+                    onClick={handleRequestStartPracticing}
+                    disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
+                  >
+                    {pendingAutoStartPractice || isStarting ? "Starting…" : "Practice!"}
+                  </SlButton>
+                )}
+                <SlButton size="large" circle aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}>
+                  ⚙&#xFE0E;
+                </SlButton>
+              </div>
+
+              {practiceMode === "off" ? (
+                <div style={styles.diagnosticHint}>
+                  {TRACKING_MODE_SHORT_LABELS[trackingMode]}
+                  {trackingMode === "metronome" ? ` ${metronomeBpm} BPM` : ""} · {gradeReference === "a440" ? "A440" : "own tuning"} ·{" "}
+                  {STRICTNESS_BANDS[gradeStrictness].label}
+                </div>
+              ) : null}
+
+              {practiceMode === "active" && followerState?.current ? (
+                <>
+                  <div style={styles.readoutCard}>
+                    <div style={styles.readoutLabel}>Current note</div>
+                    <div style={styles.readoutValueLarge}>{followerState.current.pitchLabel ?? "--"}</div>
+                    <div style={styles.diagnosticHint}>Measure {followerState.current.measureIndex + 1}</div>
+                  </div>
+                  <div style={styles.readoutCard}>
+                    <div style={styles.readoutLabel}>Intonation</div>
+                    <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
+                    <div style={styles.diagnosticHint}>{formatCents(liveCentsFromExpected)} vs. expected</div>
+                  </div>
+                </>
+              ) : null}
+
+              {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" && !spotEnabled ? (
+                <div style={styles.diagnosticHint}>{jumpMessage ?? "Lost? Tap the note you're on to jump there."}</div>
+              ) : null}
+            </aside>
+            </div>
           ) : null}
         </section>
       </main>
@@ -2231,6 +2231,11 @@ const styles: Record<string, CSSProperties> = {
   shell: {
     width: "100%",
     maxWidth: "920px"
+  },
+  // The Practice tab is wider by the control column, so the score keeps its width on a laptop.
+  shellWide: {
+    width: "100%",
+    maxWidth: "1140px"
   },
   heroCard: {
     position: "relative",
@@ -2336,9 +2341,28 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "13px",
     lineHeight: 1.4
   },
-  foldSummaryHint: {
-    color: "rgba(204, 214, 232, 0.68)",
-    fontSize: "13px"
+  // Practice tab once a score is loaded: score column + a control column that sticks in view.
+  practiceLayout: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) 200px",
+    gap: "14px",
+    alignItems: "start",
+    marginTop: "8px"
+  },
+  practiceMain: {
+    minWidth: 0
+  },
+  practiceSidebar: {
+    position: "sticky",
+    top: "12px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px"
+  },
+  sidebarButtons: {
+    display: "flex",
+    gap: "8px",
+    alignItems: "center"
   },
   metaRow: {
     display: "grid",
@@ -2390,7 +2414,7 @@ const styles: Record<string, CSSProperties> = {
   },
   importCard: {
     position: "relative",
-    overflow: "hidden",
+    overflow: "clip", // not "hidden": that would stop the control column sticking
     borderRadius: "18px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
