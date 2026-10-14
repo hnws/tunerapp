@@ -22,6 +22,40 @@ export interface SavedTake {
   // bands are applied on top -- see practice/reviewSummary.ts).
   history: NoteAccuracyRecord[];
   scoringSource: "offline" | "live" | null;
+  // Added for the server-side take archive (see uploadTake): how the take was tracked.
+  mode?: "matchmaker" | "metronome";
+  bpm?: number | null;
+  scoreTitle?: string;
+}
+
+// Keep a finished take on the server (config.archiveTakes). A Matchmaker take's audio is already
+// there (the alignment session saved it under sessionId), so only the results go up; a metronome
+// take has no session, so its audio is uploaded first, in parts small enough for the proxies.
+const UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+
+export async function uploadTake(take: SavedTake, audio: Float32Array | null, sessionId: string | null): Promise<string> {
+  let id = sessionId;
+  if (!id) {
+    const created = await fetch("/api/takes/new", { method: "POST" });
+    if (!created.ok) throw new Error(`Couldn't start a take upload (HTTP ${created.status}).`);
+    id = String(((await created.json()) as { takeId: string }).takeId);
+  }
+  if (audio && !sessionId) {
+    const wav = encodeWav16(audio, take.sampleRate);
+    const pcm = wav.subarray(44); // raw little-endian int16, the server adds the header
+    for (let offset = 0; offset < pcm.length; offset += UPLOAD_PART_BYTES) {
+      const part = new Uint8Array(pcm.subarray(offset, Math.min(pcm.length, offset + UPLOAD_PART_BYTES))); // a copy: its buffer is a plain ArrayBuffer
+      const response = await fetch(`/api/takes/${id}/audio`, { method: "POST", body: new Blob([part.buffer]), headers: { "Content-Type": "application/octet-stream" } });
+      if (!response.ok) throw new Error(`Audio upload failed (HTTP ${response.status}).`);
+    }
+  }
+  const response = await fetch(`/api/takes/${id}/result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(take)
+  });
+  if (!response.ok) throw new Error(`Saving the take failed (HTTP ${response.status}).`);
+  return String(((await response.json()) as { id: string }).id);
 }
 
 export function encodeWav16(samples: Float32Array, sampleRate: number): Uint8Array {

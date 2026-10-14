@@ -261,7 +261,7 @@ def check_alignment_progress() -> None:
         feed(aligner, np.concatenate([junk, audio]))
         beats, times = aligner.matchmaker.score_follower.alignment_path
         at_5s = float(beats[min(len(beats) - 1, int(np.searchsorted(times, 5.0)))])
-        accepted, rejected = aligner.frame_stats()
+        accepted, rejected, _speech = aligner.frame_stats()
         check(f"holds at the start through 5s of leading {label}", at_5s < 0.5, f"position {at_5s:.2f} qn; rejected {rejected} frames")
         check(f"still reaches the end after the {label}", float(beats[-1]) >= 6.0, f"final {float(beats[-1]):.2f} of 8")
 

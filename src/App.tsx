@@ -1,5 +1,5 @@
-import type { ChangeEvent, CSSProperties, ReactElement } from "react";
-import { useEffect, useRef, useState } from "react";
+import type { ChangeEvent, CSSProperties, MouseEvent, ReactElement } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   createMicrophoneCaptureController,
   type LiveCaptureState,
@@ -7,9 +7,13 @@ import {
   type StartCaptureOptions
 } from "../audio/captureModule";
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
+import { DEFAULT_APP_CONFIG, type AppConfig, type TrackingModeId } from "./appConfig";
+import { TunerPanel } from "./TunerPanel";
+import { statusStyles } from "./captureStatus";
+import { SlButton, SlCheckbox, SlDetails, SlDrawer, SlInput, SlOption, SlRadioButton, SlRadioGroup, SlSelect, SlTab, SlTabGroup, eventChecked, eventValue, isOwnEvent } from "./ui";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
-import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight } from "../score/renderer";
+import { renderScore, type MeasureBox, type RenderedScoreHandle, type ScoreCursor, type NoteHighlight, type StartMarkerBox } from "../score/renderer";
 import type { CursorNoteInfo, QuarterIndexEntry } from "../score/renderer/scoreCursor";
 import { ScoreFollower, DEFAULT_SCORE_FOLLOWER_CONFIG, type ScoreFollowerState } from "../practice/cursor";
 import { MetronomeScoreFollower, DEFAULT_METRONOME_FOLLOWER_CONFIG } from "../practice/metronomeFollower";
@@ -22,12 +26,51 @@ import {
   type AlignmentPoint
 } from "../practice/offlineIntonationScorer";
 import { MatchmakerStream, type MatchmakerStreamStatus } from "../audio/matchmakerStream";
-import { createBeatClock, computeTimeSignatureSegments, type BeatClock, type ClickSubdivision } from "../practice/metronome";
+import { createBeatClock, computeTimeSignatureSegments, resolveClickSubdivision, CLICK_SUBDIVISION_QUARTERS, type BeatClock, type ClickSubdivision } from "../practice/metronome";
 import { DEFAULT_GRADING, STRICTNESS_BANDS, gradingOptions, summarizePracticeSession, type GradeReference, type GradeStrictness } from "../practice/reviewSummary";
-import { downloadTake, type SavedTake } from "../practice/takeExport";
+import { downloadTake, type SavedTake, uploadTake } from "../practice/takeExport";
 import { historyInRegion, passIsOver, resolveSpotRegion, summarizePass, type SpotPassResult, type SpotRegion } from "../practice/spotPractice";
 
 type ImportState = "idle" | "loading" | "success" | "error";
+
+type AppTab = "tuner" | "practice";
+const APP_TABS: ReadonlyArray<{ id: AppTab; label: string }> = [
+  { id: "tuner", label: "Tuner" },
+  { id: "practice", label: "Practice" }
+];
+const TAB_STORAGE_KEY = "tunerapp.activeTab";
+// Shoelace options can't have an empty value; these stand for "" in the two selects that need it.
+const SYSTEM_DEFAULT_DEVICE = "system-default";
+const KEEP_DURATION = "keep";
+// Names and one-line descriptions of the tracking modes a deployment offers (config.trackingModes;
+// see src/appConfig.ts), as shown in the Settings drawer and the side column.
+const TRACKING_MODE_SHORT_LABELS: Record<TrackingModeId, string> = {
+  matchmaker: "Matchmaker",
+  metronome: "Metronome",
+  listening: "Listening"
+};
+const TRACKING_MODE_DESCRIPTIONS: Record<TrackingModeId, string> = {
+  matchmaker: "Follows your playing (alignment server) and grades after the take. Best for bowed parts.",
+  metronome: "The cursor moves at a set tempo; play along with the click. Pitch is still graded. Best for plucked parts.",
+  listening: "Follows detected pitch and note starts in the browser (experimental)."
+};
+const AUTO_SCROLL_STORAGE_KEY = "tunerapp.autoScroll";
+const SCORE_STORAGE_KEY = "tunerapp.scoreUrl";
+// Live intonation readout smoothing (see the readout in App): median of up to this many readings
+// of the current note, shown once there are at least LIVE_READOUT_MIN_READINGS; beyond
+// LIVE_READOUT_BETWEEN_NOTES_CENTS the reading is a different note, not intonation.
+const LIVE_READOUT_WINDOW = 6;
+const LIVE_READOUT_MIN_READINGS = 3;
+const LIVE_READOUT_BETWEEN_NOTES_CENTS = 100;
+// With no pitch heard for this long the card goes back to "Listening…" instead of keeping the
+// last note's verdict on the screen.
+const LIVE_READOUT_STALE_MS = 800;
+const OWN_FILE = "own-file"; // sl-option values can't be empty: stands for "a file you uploaded"
+// Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
+// leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
+// next line is visible below it).
+const AUTO_SCROLL_BAND: readonly [number, number] = [0.12, 0.7];
+const AUTO_SCROLL_TARGET = 0.3;
 
 const LIVE_CAPTURE_OPTIONS: StartCaptureOptions = {
   frameSize: 2048,
@@ -44,17 +87,8 @@ const LIVE_CAPTURE_OPTIONS: StartCaptureOptions = {
   channelCount: 1
 };
 
-function formatConfidence(value: number): string {
-  return `${(value * 100).toFixed(0)}%`;
-}
 
-function formatFrequency(value: number | null): string {
-  if (value === null) {
-    return "--";
-  }
 
-  return `${value.toFixed(2)} Hz`;
-}
 
 function formatCents(value: number | null): string {
   if (value === null) {
@@ -65,12 +99,20 @@ function formatCents(value: number | null): string {
   return `${rounded} cents`;
 }
 
-function formatTempo(value: number | null): string {
-  if (value === null) {
-    return "--";
-  }
+const TEMPO_UNIT_LABELS: Record<ClickSubdivision, string> = {
+  auto: "beat",
+  sixteenth: "16th",
+  eighth: "8th",
+  quarter: "quarter",
+  dottedQuarter: "dotted quarter"
+};
 
-  return `${value} BPM`;
+// The printed mark when there is one ("60 per 16th"), else the quarter-note BPM.
+function formatTempo(score: { tempoBpm: number | null; tempoMark?: { beatUnit: ClickSubdivision; perMinute: number } | null }): string {
+  if (score.tempoMark) {
+    return `${score.tempoMark.perMinute} per ${TEMPO_UNIT_LABELS[score.tempoMark.beatUnit]}`;
+  }
+  return score.tempoBpm === null ? "--" : `${score.tempoBpm} BPM`;
 }
 
 // Quarter-note-unit values, matching NOTE_TYPE_BY_QUARTER_NOTES in
@@ -104,25 +146,14 @@ const SPOT_PASS_END_PAUSE_MS = 1200;
 const SPOT_NEXT_PASS_DELAY_MS = 1500;
 const OFFLINE_SCORING_TIMEOUT_MS = 15_000;
 
-function statusLabel(status: LiveCaptureState["status"]): string {
-  switch (status) {
-    case "requesting":
-      return "Requesting microphone";
-    case "calibrating":
-      return "Calibrating";
-    case "listening":
-      return "Listening";
-    case "suspended":
-      return "Paused";
-    case "error":
-      return "Error";
-    case "idle":
-    default:
-      return "Idle";
-  }
+// "+12¢", "-3¢", "0¢": rounded before the sign is chosen, so -0.4 doesn't print as "-0¢".
+function formatSignedCents(cents: number): string {
+  const rounded = Math.round(cents);
+  return `${rounded > 0 ? "+" : ""}${rounded === 0 ? 0 : rounded}¢`;
 }
 
-export default function App(): ReactElement {
+
+export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfig }): ReactElement {
   const controllerRef = useRef<MicrophoneCaptureController | null>(null);
   if (!controllerRef.current) {
     controllerRef.current = createMicrophoneCaptureController();
@@ -138,6 +169,9 @@ export default function App(): ReactElement {
   const [importError, setImportError] = useState<string | null>(null);
   const [renderError, setRenderError] = useState<string | null>(null);
   const scoreContainerRef = useRef<HTMLDivElement | null>(null);
+  // Hidden native file inputs, opened from Shoelace buttons.
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const musicXmlInputRef = useRef<HTMLInputElement | null>(null);
   // Dev-only toggle: when a measure's parsed duration doesn't match its time signature (usually
   // HOMR missing a mid-piece meter change -- see musicxmlImport.ts's mismatch warning), infer and
   // insert a corrected time signature for that single measure instead of just warning. Off by
@@ -146,6 +180,134 @@ export default function App(): ReactElement {
   // both the next import (ScoreDocument model) and, live, the rendered notation (renderScore
   // effect below depends on this).
   const [autoCorrectTimeSignatures, setAutoCorrectTimeSignatures] = useState(false);
+
+  // Which entry of config.scores is loaded ("" once a file is uploaded instead). Remembered per
+  // browser, so the dropdown's choice comes back on the next visit instead of config.defaultScore.
+  const [scoreChoice, setScoreChoice] = useState<string>("");
+
+  const loadScoreFromUrl = useCallback(async (url: string, optional: boolean): Promise<void> => {
+    setImportState("loading");
+    try {
+      const response = await fetch(url);
+      if (!response.ok && optional) {
+        setImportState("idle");
+        return;
+      }
+      if (!response.ok) {
+        throw new Error(`Couldn't load the score at ${url} (HTTP ${response.status}).`);
+      }
+      const xmlData = await response.text();
+      const score = await importMusicXmlToScore(xmlData, { autoCorrectTimeSignatures: false });
+      setImportResult({ score, transientBoundingBoxes: [], xmlData });
+      setImportState("success");
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "Couldn't load the score.");
+      setImportState("error");
+    }
+  }, []);
+
+  function forgetScoreChoice(): void {
+    setScoreChoice("");
+    try {
+      window.localStorage.removeItem(SCORE_STORAGE_KEY);
+    } catch {
+      // Storage unavailable.
+    }
+  }
+
+  function chooseScore(url: string): void {
+    setScoreChoice(url);
+    try {
+      window.localStorage.setItem(SCORE_STORAGE_KEY, url);
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
+    if (url) {
+      void loadScoreFromUrl(url, false);
+    }
+  }
+
+  // Load a score on startup: ?score=<url> wins (?score=none starts empty), then the dropdown
+  // choice remembered in this browser (if it's still offered), then config.defaultScore ("" or a
+  // missing file = start empty). Choosing a file afterwards replaces it as usual.
+  useEffect(() => {
+    const param = new URLSearchParams(window.location.search).get("score");
+    if (param === "none") {
+      return;
+    }
+    let remembered: string | null = null;
+    try {
+      remembered = window.localStorage.getItem(SCORE_STORAGE_KEY);
+    } catch {
+      remembered = null;
+    }
+    const offered = (url: string | null) => url !== null && config.scores.some((entry) => entry.url === url);
+    const url = param ?? (offered(remembered) ? remembered : config.defaultScore);
+    if (!url) {
+      return;
+    }
+    if (offered(url)) {
+      setScoreChoice(url);
+    }
+    void loadScoreFromUrl(url, param === null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Two screens: the free tuner and score practice (default). Both sections stay mounted and are
+  // only hidden, so a running microphone or practice session survives switching tabs; the choice is
+  // remembered per browser.
+  const [activeTab, setActiveTab] = useState<AppTab>(() => {
+    try {
+      return window.localStorage.getItem(TAB_STORAGE_KEY) === "tuner" ? "tuner" : "practice";
+    } catch {
+      return "practice";
+    }
+  });
+
+  function selectTab(tab: AppTab): void {
+    setActiveTab(tab);
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {
+      // Storage unavailable (private mode): the tab just isn't remembered.
+    }
+    if (tab === "practice") {
+      // OSMD lays the score out against its container's width, which is 0 while the section is
+      // hidden; its autoResize listens for window resizes, so trigger one once the tab is shown.
+      window.requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    }
+  }
+
+  // The upload controls fold away once a score is loaded (open while there's none).
+  const [uploadOpen, setUploadOpen] = useState(true);
+  useEffect(() => {
+    if (importState === "success") {
+      setUploadOpen(false);
+    } else if (importState === "idle" || importState === "error") {
+      setUploadOpen(true);
+    }
+  }, [importState]);
+
+  // The Settings drawer (tracking, auto-scroll, grading), opened from the gear next to Practice!.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Keep the cursor in view while practising (remembered per browser, on by default).
+  const [autoScrollEnabled, setAutoScrollEnabled] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(AUTO_SCROLL_STORAGE_KEY) !== "off";
+    } catch {
+      return true;
+    }
+  });
+
+  function handleAutoScrollChange(enabled: boolean): void {
+    setAutoScrollEnabled(enabled);
+    try {
+      window.localStorage.setItem(AUTO_SCROLL_STORAGE_KEY, enabled ? "on" : "off");
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
+  }
 
   // OMR/import correction panel (score/correctionUI/noteXmlCorrection.ts) -- "measureIndex:noteIndex"
   // keying a single ScoreNote (see that file's header comment for why notes are addressed this
@@ -159,9 +321,8 @@ export default function App(): ReactElement {
 
   const followerRef = useRef<ScoreFollower | MetronomeScoreFollower | MatchmakerScoreFollower | null>(null);
   const matchmakerStreamRef = useRef<MatchmakerStream | null>(null);
-  // The current Matchmaker session's note list and quarter index, for "Jump to bar".
+  // The current Matchmaker session's note list and quarter index, for jumping by tapping a note.
   const sessionNotesRef = useRef<{ notes: CursorNoteInfo[]; quarterIndex: QuarterIndexEntry[] } | null>(null);
-  const [jumpBarInput, setJumpBarInput] = useState("");
   // Spot practice (practice/spotPractice.ts): loop bars From-To, one graded pass at a time.
   const [spotEnabled, setSpotEnabled] = useState(false);
   const [spotFromInput, setSpotFromInput] = useState("");
@@ -185,10 +346,37 @@ export default function App(): ReactElement {
   const [jumpMessage, setJumpMessage] = useState<string | null>(null);
   const [scoreCursor, setScoreCursor] = useState<ScoreCursor | null>(null);
   const [followerState, setFollowerState] = useState<ScoreFollowerState | null>(null);
-  // "counting_in" is the metronome-mode-only gap between clicking "Practice this score" and the
+  // "counting_in" is the metronome-mode-only gap between clicking "Practice!" and the
   // follower actually starting -- see handleStartPracticing()'s count-in handling below. Listening
   // mode never enters this state; it goes straight from "off" to "active".
   const [practiceMode, setPracticeMode] = useState<"off" | "counting_in" | "active">("off");
+
+  // Follow the cursor down the page while practising. Done here rather than with OSMD's own
+  // followCursor option because ScoreCursor also walks the OSMD cursor internally (quarter index,
+  // look-ahead), and followCursor would scroll the page on every one of those steps. Only scrolls
+  // when the cursor leaves AUTO_SCROLL_BAND, so it doesn't fight a player who scrolls by hand.
+  const followedStepIndex = followerState?.current?.stepIndex ?? null;
+  useEffect(() => {
+    if (!autoScrollEnabled || practiceMode !== "active" || followedStepIndex === null) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const cursorElement = scoreContainerRef.current?.querySelector<HTMLElement>('img[id^="cursorImg"]');
+      if (!cursorElement || cursorElement.style.display === "none") {
+        return;
+      }
+      const rect = cursorElement.getBoundingClientRect();
+      if (rect.height === 0) {
+        return; // practice tab hidden
+      }
+      const viewportHeight = window.innerHeight;
+      const [bandTop, bandBottom] = AUTO_SCROLL_BAND;
+      if (rect.top < viewportHeight * bandTop || rect.bottom > viewportHeight * bandBottom) {
+        window.scrollBy({ top: rect.top - viewportHeight * AUTO_SCROLL_TARGET, behavior: "smooth" });
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [autoScrollEnabled, practiceMode, followedStepIndex]);
   // Mirrors practiceMode for the click player's onCountInComplete callback, which fires
   // asynchronously (after a real-time delay) via a plain closure captured when the count-in
   // started -- by the time it fires, that closure's own view of practiceMode is stale (state
@@ -204,7 +392,67 @@ export default function App(): ReactElement {
   // (practice/matchmakerFollower.ts) delegates the position decision to the Matchmaker library
   // running in the Python server. All three coexist so they can be compared against real playing --
   // the first has never been reliable live, and the third is new and unproven.
-  const [trackingMode, setTrackingMode] = useState<"listening" | "metronome" | "matchmaker">("matchmaker");
+  const [trackingMode, setTrackingMode] = useState<TrackingModeId>(config.defaultTrackingMode);
+
+  // "Start here": click a note on the score (while not practising) to start the next Matchmaker
+  // take from it -- the same seek a tap-to-jump makes, sent before any audio. Clicking the first
+  // note clears it. sessionStartRegion is what the running/last take actually used, so the summary
+  // and the colours cover only the notes from the start onwards.
+  const [startPoint, setStartPoint] = useState<{ quarter: number; stepIndex: number } | null>(null);
+  const [startMarker, setStartMarker] = useState<StartMarkerBox | null>(null);
+  const [sessionStartRegion, setSessionStartRegion] = useState<SpotRegion | null>(null);
+  useEffect(() => {
+    setStartPoint(null);
+  }, [scoreCursor]);
+  useEffect(() => {
+    if (!startPoint || !scoreCursor) {
+      setStartMarker(null);
+      return;
+    }
+    const refresh = () => setStartMarker(renderedScoreRef.current?.markerAt(startPoint.quarter) ?? null);
+    // OSMD's own resize re-render is debounced; measure after it settles (same as the bar boxes).
+    let timer = window.setTimeout(refresh, 50);
+    const onResize = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(refresh, 400);
+    };
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", onResize);
+    };
+  }, [startPoint, scoreCursor]);
+
+  function handleScoreClick(event: MouseEvent<HTMLDivElement>): void {
+    // Bar taps belong to spot practice while it's on.
+    if (spotEnabled || !scoreCursor) {
+      return;
+    }
+    const hit = renderedScoreRef.current?.noteAt(event.clientX, event.clientY);
+    if (!hit) {
+      return;
+    }
+    // During a Matchmaker take a tap is a jump ("I'm here now"); otherwise it picks the start.
+    if (practiceMode === "active") {
+      if (trackingMode === "matchmaker" && followerState?.status === "in_progress") {
+        handleJumpToQuarter(hit.quarter);
+      }
+      return;
+    }
+    if (practiceMode !== "off") {
+      return;
+    }
+    // Snap to the first note that starts at or after the click, so a rest or a tied continuation
+    // starts the take from the next note actually played.
+    const entry = [...scoreCursor.buildQuarterIndex()]
+      .sort((a, b) => a.quarter - b.quarter)
+      .find((candidate) => candidate.quarter >= hit.quarter - 1e-6);
+    if (!entry || entry.stepIndex === 0) {
+      setStartPoint(null);
+      return;
+    }
+    setStartPoint({ quarter: entry.quarter, stepIndex: entry.stepIndex });
+  }
   const [matchmakerStatus, setMatchmakerStatus] = useState<MatchmakerStreamStatus>("idle");
   // Post-practice scoring: whether the server's alignment has arrived and local scoring begun (the
   // fallback timer stands down once it has), and how far along it is.
@@ -212,11 +460,33 @@ export default function App(): ReactElement {
   // The most recent Matchmaker take, kept for "Download this take" (practice/takeExport.ts). The
   // history is filled in at download time from the follower's final state.
   const lastTakeRef = useRef<{ take: Omit<SavedTake, "history" | "scoringSource" | "savedAt">; audio: Float32Array } | null>(null);
+  // The stream of the current/last session, kept past teardown (its recording and diagnostics
+  // survive stop()) so the take archive can read them once the follower has finished.
+  const archiveStreamRef = useRef<MatchmakerStream | null>(null);
+  const archivedForRef = useRef<object | null>(null);
+  const [archivedTakeId, setArchivedTakeId] = useState<string | null>(null);
+  const liveReadingsRef = useRef<{ step: number | null; values: number[] }>({ step: null, values: [] });
+  const [liveIntonation, setLiveIntonation] = useState<number | null>(null);
   const [takeAvailable, setTakeAvailable] = useState(false);
   const [offlineScoringProgress, setOfflineScoringProgress] = useState<number | null>(null);
   const [matchmakerError, setMatchmakerError] = useState<string | null>(null);
-  // How the finished take is graded -- see practice/reviewSummary.ts. "own" by default.
-  const [gradeReference, setGradeReference] = useState<GradeReference>(DEFAULT_GRADING.reference);
+  // How the finished take is graded -- see practice/reviewSummary.ts. A440 by default; remembered per browser.
+  const [gradeReference, setGradeReference] = useState<GradeReference>(() => {
+    try {
+      const saved = localStorage.getItem("tunerapp.gradeReference");
+      return saved === "own" || saved === "a440" ? saved : DEFAULT_GRADING.reference;
+    } catch {
+      return DEFAULT_GRADING.reference;
+    }
+  });
+  const chooseGradeReference = (value: GradeReference) => {
+    setGradeReference(value);
+    try {
+      localStorage.setItem("tunerapp.gradeReference", value);
+    } catch {
+      // Storage unavailable (private window): the choice just won't persist.
+    }
+  };
   // Green/amber band widths (practice/reviewSummary.ts STRICTNESS_BANDS). Remembered per browser.
   const [gradeStrictness, setGradeStrictness] = useState<GradeStrictness>(() => {
     try {
@@ -243,6 +513,7 @@ export default function App(): ReactElement {
     chunksSent: number;
     framesAccepted: number;
     framesRejected: number;
+    framesSpeech: number;
     positionsReceived: number;
     lastQuarter: number | null;
     stepIndex: number | null;
@@ -290,7 +561,7 @@ export default function App(): ReactElement {
   // that opened it was low-confidence, so a fast run's weaker attacks are less likely to get cut
   // off before a stable reading lands.
   const [energyOnsetFusionEnabled, setEnergyOnsetFusionEnabled] = useState(true);
-  // Set by "Practice this score" when the mic isn't listening yet, so practicing can start
+  // Set by "Practice!" when the mic isn't listening yet, so practicing can start
   // automatically once calibration finishes instead of requiring a separate manual mic-start
   // step first. Cleared once it fires (or the mic start fails) so a later unrelated mic restart
   // doesn't unexpectedly auto-launch practice.
@@ -314,8 +585,8 @@ export default function App(): ReactElement {
     };
   }, []);
 
-  function handleDeviceChange(event: ChangeEvent<HTMLSelectElement>): void {
-    setSelectedDeviceId(event.target.value);
+  function handleDeviceChange(value: string): void {
+    setSelectedDeviceId(value === SYSTEM_DEFAULT_DEVICE ? "" : value);
   }
 
   useEffect(() => {
@@ -342,8 +613,9 @@ export default function App(): ReactElement {
         setScoreCursor(resolvedHandle.cursor);
       })
       .catch((err) => {
+        console.error("Score render failed", err);
         if (!cancelled) {
-          setRenderError(err instanceof Error ? err.message : "Unknown error while rendering the score.");
+          setRenderError(err instanceof Error ? err.message : `Unknown error while rendering the score (${String(err)}).`);
         }
       });
 
@@ -363,11 +635,24 @@ export default function App(): ReactElement {
     };
   }, [importState, importResult, autoCorrectTimeSignatures]);
 
+  // The score's tempo mark sets the clicks-per-minute AND the click unit (a sixteenth = 60
+  // exercise clicks once per note); a bare quarter-note tempo keeps the automatic unit.
   useEffect(() => {
-    if (importResult?.score.tempoBpm) {
+    if (importResult?.score.tempoMark) {
+      setMetronomeBpm(importResult.score.tempoMark.perMinute);
+      setClickSubdivision(importResult.score.tempoMark.beatUnit);
+    } else if (importResult?.score.tempoBpm) {
       setMetronomeBpm(importResult.score.tempoBpm);
+      setClickSubdivision("auto");
     }
   }, [importResult]);
+
+  // The Settings tempo in quarter notes per minute: what the alignment reference is rendered at.
+  function referenceQuarterBpm(): number {
+    const unit = resolveClickSubdivision(clickSubdivision, importResult?.score.timeSignature);
+    const bpm = Math.min(300, Math.max(20, metronomeBpm || 90));
+    return bpm * CLICK_SUBDIVISION_QUARTERS[unit];
+  }
 
   useEffect(() => {
     if (trackingMode !== "matchmaker" || practiceMode === "off") {
@@ -385,6 +670,7 @@ export default function App(): ReactElement {
         chunksSent: stream.chunksSent,
         framesAccepted: stream.framesAccepted,
         framesRejected: stream.framesRejected,
+        framesSpeech: stream.framesSpeech,
         positionsReceived: stream.positionsReceived,
         lastQuarter: stream.lastQuarter,
         stepIndex: follower?.stepIndex ?? null,
@@ -443,17 +729,85 @@ export default function App(): ReactElement {
     // changes after the session.
     // Back to "off" now that the session has actually ended (naturally or via End Practice) --
     // this is also what hides the live "Current note"/"Intonation" readout below (gated on
-    // practiceMode === "active") and swaps the button back to "Practice this score", so both
+    // practiceMode === "active") and swaps the button back to "Practice!", so both
     // need this, not just the button.
     setPracticeMode("off");
   }, [followerState, scoreCursor]);
+
+  // Take archive (config.archiveTakes): once a take has its final results, send them to the
+  // server. A Matchmaker take's audio is already there under the session id; a metronome take's
+  // recording goes up with them. Once per follower, however often the state re-emits.
+  useEffect(() => {
+    if (!config.archiveTakes || !followerState || !importResult) return;
+    if (followerState.status !== "completed" && followerState.status !== "stopped") return;
+    const follower = followerRef.current;
+    if (!follower || archivedForRef.current === follower) return;
+    const stream = archiveStreamRef.current;
+    const savedAt = new Date().toISOString();
+    const scoreTitle = importResult.score.title;
+    let take: SavedTake;
+    let audio: Float32Array | null = null;
+    let sessionId: string | null = null;
+    if (follower instanceof MatchmakerScoreFollower) {
+      const saved = lastTakeRef.current;
+      if (!saved) return;
+      sessionId = stream?.getDiagnostics().sessionId ?? null;
+      audio = sessionId ? null : saved.audio;
+      take = { ...saved.take, savedAt, history: followerState.history, scoringSource: follower.getScoringSource(), mode: "matchmaker", scoreTitle };
+    } else if (follower instanceof MetronomeScoreFollower) {
+      if (!stream) return;
+      const sampleRate = stream.getDiagnostics().sampleRate ?? 48_000;
+      audio = stream.getRecordedAudio();
+      if (audio.length < sampleRate) return; // under a second of sound: nothing to keep
+      take = {
+        format: "tunerapp-take",
+        version: 1,
+        savedAt,
+        sampleRate,
+        scoreXml: importResult.xmlData,
+        path: [],
+        notes: [],
+        quarterIndex: [],
+        detectorSetup: {
+          sampleRate,
+          gainScalar: captureState.gainScalar,
+          silenceRmsThreshold: captureState.silenceRmsThreshold,
+          frameSize: analysisFrameSizeFor(sampleRate, LIVE_CAPTURE_OPTIONS.frameSize ?? 2048),
+          hopSize: Math.round(sampleRate * OFFLINE_ANALYSIS_INTERVAL_SECONDS),
+          confidenceThreshold: LIVE_CAPTURE_OPTIONS.confidenceThreshold ?? 0.67,
+          lowCutHz: LIVE_CAPTURE_OPTIONS.lowCutHz ?? 80,
+          highCutHz: LIVE_CAPTURE_OPTIONS.highCutHz ?? 3500,
+          smoothingWindowFrames: OFFLINE_SMOOTHING_FRAMES
+        },
+        scoringConfig: {
+          inTuneCentsThreshold: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.inTuneCentsThreshold,
+          minSamplesForVerdict: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.minSamplesForVerdict,
+          settleMs: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.onsetSettleMs,
+          plausibilityHighConfidenceThreshold: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityHighConfidenceThreshold,
+          plausibilityLowConfidenceCentsLimit: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityLowConfidenceCentsLimit,
+          plausibilityAbsoluteCentsLimit: DEFAULT_MATCHMAKER_FOLLOWER_CONFIG.plausibilityAbsoluteCentsLimit
+        },
+        history: followerState.history,
+        scoringSource: "live",
+        mode: "metronome",
+        bpm: metronomeBpm,
+        scoreTitle
+      };
+    } else {
+      return;
+    }
+    archivedForRef.current = follower;
+    uploadTake(take, audio, sessionId)
+      .then((id) => setArchivedTakeId(id))
+      .catch((error) => console.warn("The take wasn't archived", error));
+  }, [followerState, importResult, config.archiveTakes, captureState.gainScalar, captureState.silenceRmsThreshold, metronomeBpm]);
 
   // Session-end highlights: out of tune red, close amber, not played grey. Re-runs when the
   // grading reference changes, so switching "my tuning"/A440 recolours the score in place.
   useEffect(() => {
     if (!scoreCursor || !followerState) return;
     if (followerState.status !== "completed" && followerState.status !== "stopped") return;
-    const summary = summarizePracticeSession(historyInRegion(followerState.history, activeSpotRegion), gradingOptions(gradeReference, gradeStrictness));
+    const summary = summarizePracticeSession(historyInRegion(followerState.history, activeSpotRegion ?? sessionStartRegion), gradingOptions(gradeReference, gradeStrictness));
     const highlights: NoteHighlight[] = [
       ...summary.unstableNoteIds.map((id) => ({ stepIndex: Number(id), color: OUT_OF_TUNE_HIGHLIGHT_COLOR })),
       ...summary.closeNoteIds.map((id) => ({ stepIndex: Number(id), color: CLOSE_HIGHLIGHT_COLOR })),
@@ -461,7 +815,7 @@ export default function App(): ReactElement {
       ...summary.unmeasuredNoteIds.map((id) => ({ stepIndex: Number(id), color: UNCLEAR_HIGHLIGHT_COLOR }))
     ];
     scoreCursor.highlightNotes(highlights);
-  }, [scoreCursor, followerState, gradeReference, gradeStrictness, activeSpotRegion]);
+  }, [scoreCursor, followerState, gradeReference, gradeStrictness, activeSpotRegion, sessionStartRegion]);
 
   // A Matchmaker take has ended and its post-practice alignment is on its way. However the follower
   // got here (End Practice, the server reporting the piece finished, the cursor running off the end
@@ -555,6 +909,12 @@ export default function App(): ReactElement {
       window.removeEventListener("resize", onResize);
     };
   }, [showSpotBars, scoreCursor]);
+
+  // Bar numbers as printed on the sheet, for text: the spot-loop state counts bars in the file
+  // (1 = first bar in the file), which differs when the file starts mid-piece or skips bars.
+  function printedBar(fileBar: number): number {
+    return measureBoxes.find((box) => box.measureIndex === fileBar - 1)?.barNumber ?? fileBar;
+  }
 
   function handleSpotBarTap(measureIndex: number): void {
     const bar = measureIndex + 1;
@@ -657,6 +1017,8 @@ export default function App(): ReactElement {
 
     const stream = new MatchmakerStream();
     matchmakerStreamRef.current = stream;
+    archiveStreamRef.current = stream;
+    setArchivedTakeId(null);
     setMatchmakerError(null);
     // Reuses metronome mode's pre-session state so the button becomes a cancel affordance while the
     // server prepares the score, rather than looking idle and clickable for several seconds.
@@ -680,7 +1042,6 @@ export default function App(): ReactElement {
       scoreNotes = scoreCursor.listNotes();
       scoreQuarterIndex = scoreCursor.buildQuarterIndex();
       sessionNotesRef.current = { notes: scoreNotes, quarterIndex: scoreQuarterIndex };
-      setJumpBarInput("");
       setJumpMessage(null);
     } catch (error) {
       console.error("Could not read the score's notes for score following", error);
@@ -717,6 +1078,20 @@ export default function App(): ReactElement {
       setSpotPasses([]);
       spotLoopingRef.current = false;
     }
+    // A note clicked as the start (a spot loop has its own first note and takes precedence).
+    const startEntry = !spotRegion && startPoint
+      ? scoreQuarterIndex.find((candidate) => Math.abs(candidate.quarter - startPoint.quarter) < 1e-6) ?? null
+      : null;
+    const startRegion: SpotRegion | null = startEntry
+      ? {
+          fromBar: 0,
+          toBar: 0,
+          firstStepIndex: startEntry.stepIndex,
+          lastStepIndex: Number.MAX_SAFE_INTEGER,
+          fromQuarter: startEntry.quarter
+        }
+      : null;
+    setSessionStartRegion(startRegion);
     let offlinePathReceived = false;
 
     const scoreOffline = async (path: AlignmentPoint[]): Promise<void> => {
@@ -810,7 +1185,8 @@ export default function App(): ReactElement {
       }, {
         // The capture module's calibrated noise-floor threshold, measured on the same raw signal
         // the alignment stream carries -- see MatchmakerStreamOptions.silenceRmsThreshold.
-        silenceRmsThreshold: captureState.silenceRmsThreshold
+        silenceRmsThreshold: captureState.silenceRmsThreshold,
+        referenceTempoBpm: referenceQuarterBpm()
       });
     } catch (error) {
       setMatchmakerError(error instanceof Error ? error.message : "Could not start alignment.");
@@ -828,30 +1204,32 @@ export default function App(): ReactElement {
     }
     beginFollowing();
     if (spotRegion && followerRef.current instanceof MatchmakerScoreFollower) {
-      // Every pass starts at the loop's first note: the same jump "Jump to bar" makes, sent before
+      // Every pass starts at the loop's first note: the same jump a tapped note makes, sent before
       // any audio, so both the live follower and the post-take alignment start there.
       stream.seek(spotRegion.fromQuarter);
       followerRef.current.jumpToQuarter(spotRegion.fromQuarter);
+    } else if (startRegion && followerRef.current instanceof MatchmakerScoreFollower) {
+      // "Start here": the same jump, to the clicked note.
+      stream.seek(startRegion.fromQuarter);
+      followerRef.current.jumpToQuarter(startRegion.fromQuarter);
     }
   }
 
-  // "Jump to bar": when one bar stops tracking (often an OMR misread), the player moves on and
-  // tells the app where they are. The server aligns the take before and after the jump
-  // separately; notes jumped over are reported as not played.
-  function handleJumpToBar(): void {
+  // Jump during a take: when one bar stops tracking (often an OMR misread), the player taps the
+  // note they're on. The server aligns the take before and after the jump separately; notes
+  // jumped over are reported as not played.
+  function handleJumpToQuarter(quarter: number): void {
     const follower = followerRef.current;
     const stream = matchmakerStreamRef.current;
     const session = sessionNotesRef.current;
-    const bar = Number.parseInt(jumpBarInput, 10);
-    if (!(follower instanceof MatchmakerScoreFollower) || !stream || !session || !Number.isFinite(bar)) {
+    if (!(follower instanceof MatchmakerScoreFollower) || !stream || !session) {
       return;
     }
-    // The first note in that bar (or the first after it, if the bar has no notes of its own).
+    // The tapped note, or the next played note after a rest or tie continuation.
     const entry = [...session.quarterIndex]
       .sort((a, b) => a.quarter - b.quarter)
-      .find((candidate) => (session.notes[candidate.stepIndex]?.measureIndex ?? -1) + 1 >= bar);
+      .find((candidate) => candidate.quarter >= quarter - 1e-6);
     if (!entry) {
-      setJumpMessage(`There's no bar ${bar} with notes in this score.`);
       return;
     }
     if (!stream.seek(entry.quarter)) {
@@ -859,12 +1237,12 @@ export default function App(): ReactElement {
       return;
     }
     follower.jumpToQuarter(entry.quarter);
-    const landedBar = (session.notes[entry.stepIndex]?.measureIndex ?? 0) + 1;
-    setJumpMessage(landedBar === bar ? `Jumped to bar ${bar}. Play from there.` : `Bar ${bar} has no notes; jumped to bar ${landedBar}.`);
+    const bar = renderedScoreRef.current?.markerAt(entry.quarter)?.barNumber;
+    setJumpMessage(bar ? `Jumped to bar ${bar}. Play from there.` : "Jumped. Play from there.");
   }
 
   function handleStartPracticing(options: { keepHighlights?: boolean } = {}): void {
-    // Without this, clicking "Practice this score" more than once while a session is already
+    // Without this, clicking "Practice!" more than once while a session is already
     // counting in or active (e.g. a few impatient clicks before the button visibly swaps to
     // "Counting in… (cancel)") creates ANOTHER BeatClock -- its own AudioContext, setInterval
     // scheduler, and eventual MetronomeScoreFollower -- on top of the one already running, since
@@ -893,6 +1271,9 @@ export default function App(): ReactElement {
       scoreCursor.highlightNotes([]);
     }
 
+    if (trackingMode !== "matchmaker") {
+      setSessionStartRegion(null); // "Start here" is a Matchmaker seek; other modes start at the top
+    }
     if (trackingMode === "matchmaker") {
       // Deferred like metronome mode's count-in, but waiting on the server preparing the score
       // rather than on a bar of clicks. sessionStartingRef stays set across the await so a second
@@ -909,6 +1290,17 @@ export default function App(): ReactElement {
     }
 
     setPracticeMode("counting_in");
+    setArchivedTakeId(null);
+    const recordingStream = controllerRef.current?.getMediaStream();
+    if (config.archiveTakes && recordingStream && importResult) {
+      // Metronome mode has no alignment session, so record the take here for the archive.
+      const recorder = new MatchmakerStream();
+      matchmakerStreamRef.current = recorder;
+      archiveStreamRef.current = recorder;
+      void recorder
+        .start(recordingStream, importResult.xmlData, { onPosition: () => undefined }, { silenceRmsThreshold: captureState.silenceRmsThreshold, recordOnly: true })
+        .catch((error) => console.warn("Take recording didn't start", error));
+    }
     const bpm = Math.min(300, Math.max(20, metronomeBpm || 90));
     // TEMPORARY diagnostic alongside the matching one in metronome.ts -- confirms the full
     // per-measure meter sequence the clock is actually working from, not just the piece's opening
@@ -989,8 +1381,8 @@ export default function App(): ReactElement {
   // "stopped" checks below), rather than silently abandoning the session like
   // handleStopPracticing() (still used as-is by the automatic mic-disconnect safety net above,
   // where popping up a summary doesn't make sense). Deliberately leaves practiceMode "active",
-  // matching how natural completion already behaves -- "Practice again" is the only way back in,
-  // same as today.
+  // matching how natural completion already behaves; the session effect then returns it to "off",
+  // which brings the Practice! button back for the next take.
   function handleEndPracticing(): void {
     followerRef.current?.stop();
     beatClockRef.current?.stop();
@@ -1021,6 +1413,7 @@ export default function App(): ReactElement {
   }
 
   async function handleSheetFileSelected(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    forgetScoreChoice(); // the dropdown now shows "a file of your own"
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) {
@@ -1045,6 +1438,7 @@ export default function App(): ReactElement {
   // Bypasses HOMR entirely -- useful for isolating the live tuner/score-following pipeline from
   // OMR pitch-recognition accuracy when testing.
   async function handleMusicXmlFileSelected(event: ChangeEvent<HTMLInputElement>): Promise<void> {
+    forgetScoreChoice(); // the dropdown now shows "a file of your own"
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) {
@@ -1121,15 +1515,74 @@ export default function App(): ReactElement {
       });
   }
 
-  const noteDisplay = captureState.isSilent || captureState.frequencyHz === null ? "No note" : captureState.note ?? "--";
-  const pitchClass = captureState.isSilent ? "idle" : captureState.note ? "active" : "searching";
-  const levelRatio = captureState.silenceRmsThreshold > 0 ? Math.min(1, captureState.rms / captureState.silenceRmsThreshold) : 0;
 
+  // Live intonation readout. The raw per-frame value compares the detected pitch with the note the
+  // live cursor is on at that instant, which in fast passages is often the neighbouring note (the
+  // live cursor lags or leads by a note), so it used to read "Off pitch" most of the time on
+  // correctly played notes (parent's report, 2026-10-11). Now: the median of the last few readings
+  // of the current note, judged with the Settings strictness band, and "Different note" (not a
+  // verdict) when the reading is nowhere near the expected pitch. The final colours after the
+  // take come from the post-take alignment and were never affected. Since 2026-10-13 the value
+  // always reflects what is sounding now: the followers report every pitched frame (implausible
+  // ones included) with a timestamp, and the card goes back to "Listening…" when nothing has
+  // been heard for LIVE_READOUT_STALE_MS -- before that a good note's "In tune" stayed up while
+  // a wrong note or silence followed (parent's report).
   const liveCentsFromExpected = followerState?.liveCentsOffFromExpected ?? null;
-  const isInTune = liveCentsFromExpected !== null && Math.abs(liveCentsFromExpected) <= DEFAULT_SCORE_FOLLOWER_CONFIG.inTuneCentsThreshold;
-  const intonationLabel = liveCentsFromExpected === null ? "Listening…" : isInTune ? "In tune" : "Off pitch";
-  const intonationColor = liveCentsFromExpected === null ? "#f5f7fb" : isInTune ? "#8ee8cb" : "#ff8a8a";
-  const sessionSummary = summarizePracticeSession(historyInRegion(followerState?.history ?? [], activeSpotRegion), gradingOptions(gradeReference, gradeStrictness));
+  const liveHeardAtMs = followerState?.liveHeardAtMs ?? null;
+  const liveStepIndex = followerState?.current?.stepIndex ?? null;
+  const [liveNowMs, setLiveNowMs] = useState(0);
+  useEffect(() => {
+    if (practiceMode !== "active") return;
+    const id = window.setInterval(() => setLiveNowMs(performance.now()), 250);
+    return () => window.clearInterval(id);
+  }, [practiceMode]);
+  useEffect(() => {
+    const readings = liveReadingsRef.current;
+    if (practiceMode !== "active") {
+      readings.step = null;
+      readings.values = [];
+      setLiveIntonation(null);
+      return;
+    }
+    if (readings.step !== liveStepIndex) {
+      readings.step = liveStepIndex;
+      readings.values = [];
+    }
+    if (liveCentsFromExpected === null || liveHeardAtMs === null) return;
+    readings.values.push(liveCentsFromExpected);
+    if (readings.values.length > LIVE_READOUT_WINDOW) readings.values.shift();
+    if (readings.values.length < LIVE_READOUT_MIN_READINGS) return;
+    const sorted = [...readings.values].sort((a, b) => a - b);
+    setLiveIntonation(sorted[Math.floor(sorted.length / 2)]);
+  }, [liveCentsFromExpected, liveHeardAtMs, liveStepIndex, practiceMode]);
+  useEffect(() => {
+    if (practiceMode !== "active" || liveHeardAtMs === null) return;
+    if (liveNowMs - liveHeardAtMs > LIVE_READOUT_STALE_MS) {
+      liveReadingsRef.current.values = [];
+      setLiveIntonation(null);
+    }
+  }, [liveNowMs, liveHeardAtMs, practiceMode]);
+  const liveBand = STRICTNESS_BANDS[gradeStrictness];
+  const liveBetweenNotes = liveIntonation !== null && Math.abs(liveIntonation) > LIVE_READOUT_BETWEEN_NOTES_CENTS;
+  const intonationLabel =
+    liveIntonation === null
+      ? "Listening…"
+      : liveBetweenNotes
+        ? "Different note"
+        : Math.abs(liveIntonation) <= liveBand.inTuneCents
+          ? "In tune"
+          : Math.abs(liveIntonation) <= liveBand.closeCents
+            ? "Close"
+            : "Off pitch";
+  const intonationColor =
+    liveIntonation === null || liveBetweenNotes
+      ? "#9aa0a6"
+      : Math.abs(liveIntonation) <= liveBand.inTuneCents
+        ? "#8ee8cb"
+        : Math.abs(liveIntonation) <= liveBand.closeCents
+          ? "#ffb020"
+          : "#ff8a8a";
+  const sessionSummary = summarizePracticeSession(historyInRegion(followerState?.history ?? [], activeSpotRegion ?? sessionStartRegion), gradingOptions(gradeReference, gradeStrictness));
   // Read on render rather than mirrored into state: every change to it coincides with a follower
   // emit, which already re-renders.
   const finalScoringSource =
@@ -1159,158 +1612,203 @@ export default function App(): ReactElement {
         button {
           font: inherit;
         }
+
+        /* Shoelace (see src/ui.ts): app font, compact spacing, and the one orange call to action. */
+        :root {
+          --sl-font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        sl-tab-group.app-tabs {
+          margin-bottom: 10px;
+        }
+        sl-details.fold::part(base) {
+          background: rgba(255, 255, 255, 0.02);
+          border-color: rgba(255, 255, 255, 0.12);
+        }
+        sl-details.fold::part(header) {
+          padding: 8px 12px;
+        }
+        sl-details.fold::part(content) {
+          padding: 4px 12px 12px;
+        }
+        sl-checkbox {
+          display: block;
+          margin-top: 6px;
+        }
+        sl-radio-group.inline-group {
+          margin-top: 8px;
+        }
+        sl-radio-group.inline-group::part(form-control) {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+        sl-radio-group.inline-group::part(form-control-label) {
+          margin: 0;
+        }
+        sl-button.practice-button::part(base) {
+          background: linear-gradient(135deg, #ffc24b 0%, #ff7a3d 100%);
+          border: none;
+          color: #06111d;
+          font-weight: 800;
+          box-shadow: 0 6px 20px rgba(255, 122, 61, 0.4);
+        }
+        sl-drawer.settings-drawer {
+          --size: min(380px, 90vw);
+        }
+        sl-button.practice-button[size="large"]::part(base) {
+          padding: 0 14px;
+        }
       `}</style>
 
-      <main style={styles.shell}>
-        <section style={styles.heroCard}>
-          <div style={styles.topRow}>
-            <div>
-              <p style={styles.kicker}>Live violin tuner</p>
-              <h1 style={styles.title}>TunerApp</h1>
-            </div>
-            <span style={{ ...styles.statusPill, ...statusStyles[captureState.status] }}>{statusLabel(captureState.status)}</span>
-          </div>
+      <main style={activeTab === "practice" ? styles.shellWide : styles.shell}>
+        <SlTabGroup className="app-tabs" onSlTabShow={(event) => selectTab(event.detail.name as AppTab)}>
+          {APP_TABS.map((tab) => (
+            <SlTab key={tab.id} slot="nav" panel={tab.id} active={activeTab === tab.id}>
+              {tab.label}
+            </SlTab>
+          ))}
+        </SlTabGroup>
 
-          <div style={styles.readoutGrid}>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Note</div>
-              <div style={styles.readoutValueLarge} data-state={pitchClass}>
-                {noteDisplay}
-              </div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Frequency</div>
-              <div style={styles.readoutValue}>{formatFrequency(captureState.frequencyHz)}</div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Cents off</div>
-              <div style={styles.readoutValue}>{formatCents(captureState.centsOff)}</div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Confidence</div>
-              <div style={styles.readoutValue}>{formatConfidence(captureState.confidence)}</div>
-            </div>
-          </div>
+        <TunerPanel
+          hidden={activeTab !== "tuner"}
+          captureState={captureState}
+          isStarting={isStarting}
+          onStart={() => void handleStart()}
+          onPause={() => void handlePause()}
+          onStop={() => void handleStop()}
+          inputDevices={inputDevices}
+          selectedDeviceId={selectedDeviceId}
+          systemDefaultDevice={SYSTEM_DEFAULT_DEVICE}
+          onDeviceChange={handleDeviceChange}
+          config={config.tuner}
+        />
 
-          <div style={styles.diagnosticsGrid}>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Live RMS</div>
-              <div style={styles.readoutValue}>{captureState.rms.toFixed(4)}</div>
-              <div style={styles.meterTrack} aria-hidden="true">
-                <div style={{ ...styles.meterFill, width: `${Math.max(6, levelRatio * 100)}%` }} />
-              </div>
-              <div style={styles.diagnosticHint}>{captureState.isSilent ? "Silence floor" : "Bow energy detected"}</div>
+        <section style={activeTab === "practice" ? styles.importCard : { ...styles.importCard, display: "none" }}>
+          {captureState.error ? <div style={styles.errorBox}>Microphone: {captureState.error.message}</div> : null}
+          <SlDetails
+            className="fold"
+            open={uploadOpen}
+            onSlShow={(event) => isOwnEvent(event) && setUploadOpen(true)}
+            onSlHide={(event) => isOwnEvent(event) && setUploadOpen(false)}
+          >
+            <div slot="summary">
+              {importState === "success" && importResult ? `Sheet music: ${importResult.score.title}` : "Sheet music: upload a photo or MusicXML"}
+              {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating, marginLeft: 10 }}>Loading…</span> : null}
             </div>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Target threshold</div>
-              <div style={styles.readoutValue}>{captureState.silenceRmsThreshold.toFixed(4)}</div>
-              <div style={styles.diagnosticHint}>Auto-calibrated from startup noise</div>
-            </div>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Gain</div>
-              <div style={styles.readoutValue}>{captureState.gainScalar.toFixed(1)}x Boost</div>
-              <div style={styles.diagnosticHint}>Software gain for weak microphones</div>
-            </div>
-          </div>
 
-          <div style={styles.metaRow}>
-            <div>
-              <div style={styles.metaLabel}>Sample rate</div>
-              <div style={styles.metaValue}>{captureState.sampleRate > 0 ? `${captureState.sampleRate} Hz` : "--"}</div>
-            </div>
-            <div>
-              <div style={styles.metaLabel}>Noise gate</div>
-              <div style={styles.metaValue}>{captureState.isSilent ? "Silent" : `RMS ${captureState.rms.toFixed(4)}`}</div>
-            </div>
-            <div>
-              <div style={styles.metaLabel}>Frame</div>
-              <div style={styles.metaValue}>{captureState.frameSize} / {captureState.hopSize}</div>
-            </div>
-          </div>
+            {config.scores.length > 0 ? (
+              <SlSelect
+                size="small"
+                label="Score"
+                hoist
+                className="score-select"
+                style={{ maxWidth: "32em", marginTop: 4 }}
+                value={scoreChoice || OWN_FILE}
+                disabled={practiceMode !== "off"}
+                onSlChange={(event) => {
+                  const url = eventValue(event);
+                  if (url !== OWN_FILE && url !== scoreChoice) chooseScore(url);
+                }}
+              >
+                {config.scores.map((entry) => (
+                  <SlOption key={entry.url} value={entry.url}>
+                    {entry.label}
+                  </SlOption>
+                ))}
+                <SlOption value={OWN_FILE}>A file of your own (below)</SlOption>
+              </SlSelect>
+            ) : null}
 
-          <div style={styles.metaRow}>
-            <div>
-              <div style={styles.metaLabel}>Active microphone</div>
-              <div style={styles.metaValue}>{captureState.activeDeviceLabel ?? "--"}</div>
-            </div>
-          </div>
-
-          <label style={styles.deviceLabel}>
-            Microphone
-            <select
-              value={selectedDeviceId}
-              onChange={handleDeviceChange}
-              style={styles.deviceSelect}
-              disabled={captureState.status === "listening" || captureState.status === "calibrating"}
-            >
-              <option value="">System default</option>
-              {inputDevices.map((device, index) => (
-                <option key={device.deviceId || index} value={device.deviceId}>
-                  {device.label || `Microphone ${index + 1}`}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          {captureState.error ? <div style={styles.errorBox}>{captureState.error.message}</div> : null}
-
-          <div style={styles.buttonRow}>
-            <button type="button" style={styles.primaryButton} onClick={handleStart} disabled={isStarting || captureState.status === "requesting"}>
-              {isStarting || captureState.status === "requesting" ? "Starting..." : "Start Microphone"}
-            </button>
-            <button type="button" style={styles.secondaryButton} onClick={handlePause} disabled={captureState.status !== "listening"}>
-              Pause
-            </button>
-            <button type="button" style={styles.secondaryButton} onClick={handleStop} disabled={captureState.status === "idle"}>
-              Stop
-            </button>
-          </div>
-
-          <p style={styles.caption}>
-            Microphone processing is configured for violin acoustics with echo cancellation, noise suppression, and automatic gain control disabled.
-          </p>
-        </section>
-
-        <section style={styles.importCard}>
-          <div style={styles.topRow}>
-            <div>
-              <p style={styles.kicker}>Sheet music import</p>
-              <h2 style={styles.subtitle}>Upload a photo</h2>
-            </div>
-            {importState === "loading" ? <span style={{ ...styles.statusPill, ...statusStyles.calibrating }}>Parsing sheet…</span> : null}
-          </div>
-
-          <div style={styles.buttonRow}>
-            <label style={styles.secondaryButton}>
-              Choose sheet music photo
-              <input type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
-            </label>
-            <label style={styles.secondaryButton}>
-              Choose MusicXML file
+            <div style={styles.buttonRow}>
+              <SlButton size="small" pill onClick={() => photoInputRef.current?.click()}>
+                Choose sheet music photo
+              </SlButton>
+              <input ref={photoInputRef} type="file" accept="image/*" onChange={handleSheetFileSelected} style={styles.hiddenFileInput} />
+              <SlButton size="small" pill onClick={() => musicXmlInputRef.current?.click()}>
+                Choose MusicXML file
+              </SlButton>
               <input
+                ref={musicXmlInputRef}
                 type="file"
                 accept=".xml,.musicxml,application/vnd.recordare.musicxml+xml,text/xml,application/xml"
                 onChange={handleMusicXmlFileSelected}
                 style={styles.hiddenFileInput}
               />
-            </label>
-          </div>
+              {importState === "success" && importResult ? (
+                <SlButton size="small" pill onClick={handleDownloadMusicXml}>
+                  Download MusicXML
+                </SlButton>
+              ) : null}
+            </div>
 
-          <label style={styles.diagnosticHint}>
-            <input
-              type="checkbox"
-              checked={autoCorrectTimeSignatures}
-              onChange={(event) => setAutoCorrectTimeSignatures(event.target.checked)}
-            />{" "}
-            Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
-            signature -- usually a missed mid-piece meter change -- infer and insert a corrected
-            one for that bar, off by default; see score/timeSignatureInference.ts)
-          </label>
+            {config.showDevOptions ? (
+              <SlCheckbox
+                size="small"
+                style={{ marginTop: 10 }}
+                checked={autoCorrectTimeSignatures}
+                onSlChange={(event) => setAutoCorrectTimeSignatures(eventChecked(event))}
+              >
+                Dev: auto-correct time signatures (when a bar's parsed beats don't match its time
+                signature -- usually a missed mid-piece meter change -- infer and insert a corrected
+                one for that bar, off by default; see score/timeSignatureInference.ts)
+              </SlCheckbox>
+            ) : null}
+
+            {practiceMode === "off" && correctableNotes.length > 0 ? (
+              <SlDetails className="fold" summary="Fix a misread note" style={{ marginTop: 10 }}>
+                <div style={styles.correctionRow}>
+                  <SlSelect
+                    size="small"
+                    hoist
+                    style={{ minWidth: "18em" }}
+                    value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
+                    onSlChange={(event) => setCorrectionNoteKey(eventValue(event))}
+                  >
+                    {correctableNotes.map(({ measureIndex, noteIndex, note }) => (
+                      <SlOption key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
+                        Measure {measureIndex + 1}, note {noteIndex + 1} — currently {note.pitch}
+                      </SlOption>
+                    ))}
+                  </SlSelect>
+                  <SlInput
+                    size="small"
+                    placeholder="Corrected pitch (e.g. C#4)"
+                    value={correctionPitchInput}
+                    onSlInput={(event) => setCorrectionPitchInput(eventValue(event))}
+                    style={{ width: "12em" }}
+                  />
+                  <SlSelect
+                    size="small"
+                    hoist
+                    value={correctionDurationInput === "" ? KEEP_DURATION : correctionDurationInput}
+                    onSlChange={(event) => setCorrectionDurationInput(eventValue(event) === KEEP_DURATION ? "" : eventValue(event))}
+                  >
+                    <SlOption value={KEEP_DURATION}>Don't change duration</SlOption>
+                    {CORRECTION_DURATION_OPTIONS.map((option) => (
+                      <SlOption key={option.label} value={String(option.quarterNotes)}>
+                        {option.label}
+                      </SlOption>
+                    ))}
+                  </SlSelect>
+                  <SlButton size="small" pill onClick={handleApplyNoteCorrection}>
+                    Apply
+                  </SlButton>
+                </div>
+                <p style={styles.diagnosticHint}>
+                  Fixes what OMR misread on a single note (pitch and/or duration) — not a full notation editor. Pick the
+                  note, enter what it should be, and leave the other field blank to keep it as-is.
+                </p>
+                {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
+              </SlDetails>
+            ) : null}
+          </SlDetails>
 
           {importState === "error" && importError ? <div style={styles.errorBox}>{importError}</div> : null}
 
           {importState === "success" && importResult ? (
-            <div style={styles.importResult}>
+            <div style={styles.practiceLayout}>
+            <div style={styles.practiceMain}>
               <div style={styles.metaRow}>
                 <div>
                   <div style={styles.metaLabel}>Title</div>
@@ -1321,7 +1819,7 @@ export default function App(): ReactElement {
                 </div>
                 <div>
                   <div style={styles.metaLabel}>Tempo</div>
-                  <div style={styles.metaValue}>{formatTempo(importResult.score.tempoBpm)}</div>
+                  <div style={styles.metaValue}>{formatTempo(importResult.score)}</div>
                 </div>
                 <div>
                   <div style={styles.metaLabel}>Key / Time</div>
@@ -1344,184 +1842,211 @@ export default function App(): ReactElement {
                     .map((issue) => `bar ${issue.measureNumber} (${issue.kind === "empty" ? "empty" : issue.kind === "short" ? "too short" : "too long"})`)
                     .join(", ")}
                   {importResult.score.measureIssues.length > 10 ? ", …" : ""}. Following can stall there: fix the note with
-                  "Fix a misread note" below, or use "Jump to bar" during practice to skip past it.
+                  "Fix a misread note" (under "Sheet music" above), or during practice tap the note you're on to jump past it.
                 </p>
               ) : null}
 
-              <div style={styles.buttonRow}>
-                <button type="button" style={styles.secondaryButton} onClick={handleDownloadMusicXml}>
-                  Download MusicXML
-                </button>
-                {practiceMode === "active" ? (
-                  <button
-                    type="button"
-                    style={styles.secondaryButton}
-                    onClick={() => {
-                      handleStopLooping();
-                      handleEndPracticing();
-                    }}
-                  >
-                    {activeSpotRegion ? "Stop looping" : "End Practice"}
-                  </button>
-                ) : null}
-                {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" ? (
-                  <form
-                    style={{ display: "flex", gap: 8, alignItems: "center" }}
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      handleJumpToBar();
-                    }}
-                  >
-                    <label style={styles.diagnosticHint} htmlFor="jump-bar">
-                      Stuck? Jump to bar
-                    </label>
-                    <input
-                      id="jump-bar"
-                      type="number"
-                      min={1}
-                      inputMode="numeric"
-                      value={jumpBarInput}
-                      onChange={(event) => setJumpBarInput(event.target.value)}
-                      style={{ width: 64 }}
-                    />
-                    <button type="submit" style={styles.secondaryButton} disabled={!jumpBarInput}>
-                      Go
-                    </button>
-                  </form>
-                ) : null}
-                {practiceMode === "active" ? null : practiceMode === "counting_in" ? (
-                  <button type="button" style={styles.secondaryButton} onClick={handleCancelCountIn}>
-                    {trackingMode === "matchmaker" ? "Preparing score… (cancel)" : "Counting in… (cancel)"}
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    style={styles.secondaryButton}
-                    onClick={handleRequestStartPracticing}
-                    disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
-                  >
-                    {pendingAutoStartPractice || isStarting ? "Starting microphone…" : "Practice this score"}
-                  </button>
-                )}
-              </div>
+              {/* Every practice setting, in a drawer opened by the gear next to Practice!. How a take is
+                  tracked can only change between takes; auto-scroll and grading apply at once (grading
+                  recolours the last take). */}
+              <SlDrawer
+                label="Settings"
+                placement="end"
+                className="settings-drawer"
+                open={settingsOpen}
+                onSlHide={(event) => isOwnEvent(event) && setSettingsOpen(false)}
+              >
+                <SlRadioGroup
+                  size="small"
+                  label="Tracking"
+                  helpText={TRACKING_MODE_DESCRIPTIONS[trackingMode]}
+                  name="trackingMode"
+                  className="inline-group"
+                  value={trackingMode}
+                  onSlChange={(event) => setTrackingMode(eventValue(event) as TrackingModeId)}
+                >
+                  {config.trackingModes.map((mode) => (
+                    <SlRadioButton key={mode} value={mode} disabled={practiceMode !== "off"}>
+                      {TRACKING_MODE_SHORT_LABELS[mode]}
+                    </SlRadioButton>
+                  ))}
+                </SlRadioGroup>
 
-              {practiceMode === "off" && correctableNotes.length > 0 ? (
-                <div style={styles.correctionPanel}>
-                  <p style={styles.metaLabel}>Fix a misread note</p>
-                  <div style={styles.correctionRow}>
-                    <select
-                      value={correctionNoteKey || `${correctableNotes[0].measureIndex}:${correctableNotes[0].noteIndex}`}
-                      onChange={(event) => setCorrectionNoteKey(event.target.value)}
-                    >
-                      {correctableNotes.map(({ measureIndex, noteIndex, note }) => (
-                        <option key={`${measureIndex}:${noteIndex}`} value={`${measureIndex}:${noteIndex}`}>
-                          Measure {measureIndex + 1}, note {noteIndex + 1} — currently {note.pitch}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      type="text"
-                      placeholder="Corrected pitch (e.g. C#4)"
-                      value={correctionPitchInput}
-                      onChange={(event) => setCorrectionPitchInput(event.target.value)}
-                      style={{ width: "10em" }}
-                    />
-                    <select value={correctionDurationInput} onChange={(event) => setCorrectionDurationInput(event.target.value)}>
-                      <option value="">Don't change duration</option>
-                      {CORRECTION_DURATION_OPTIONS.map((option) => (
-                        <option key={option.label} value={option.quarterNotes}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                    <button type="button" style={styles.secondaryButton} onClick={handleApplyNoteCorrection}>
-                      Apply
-                    </button>
-                  </div>
-                  <p style={styles.diagnosticHint}>
-                    Fixes what OMR misread on a single note (pitch and/or duration) — not a full notation editor. Pick the
-                    note, enter what it should be, and leave the other field blank to keep it as-is.
-                  </p>
-                  {correctionError ? <div style={styles.errorBox}>{correctionError}</div> : null}
-                </div>
-              ) : null}
+                {trackingMode !== "listening" ? (
+                  <SlInput
+                    size="small"
+                    type="number"
+                    label={`Tempo (clicks per minute, per ${TEMPO_UNIT_LABELS[clickSubdivision]})`}
+                    helpText={
+                      trackingMode === "metronome"
+                        ? "The cursor moves on this clock alone; pitch is compared with whatever note is scheduled."
+                        : "Roughly how fast you'll play: the follower's reference is rendered at this speed, which keeps it steadier on held notes."
+                    }
+                    min={20}
+                    max={300}
+                    value={String(metronomeBpm)}
+                    disabled={practiceMode !== "off"}
+                    // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
+                    // itself: entering "300" digit-by-digit passes through "3" first, which a
+                    // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
+                    // the field before a second digit could ever be typed. Clamp only once, on blur,
+                    // once the user is actually done editing; handleStartPracticing also clamps
+                    // defensively before constructing the follower regardless of blur.
+                    onSlInput={(event) => setMetronomeBpm(Number(eventValue(event)))}
+                    onSlBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
+                    style={{ maxWidth: "26em", marginTop: 8 }}
+                  />
+                ) : null}
 
-              {practiceMode === "off" ? (
+                {trackingMode === "metronome" ? (
+                  <SlCheckbox
+                    size="small"
+                    checked={metronomeClickThroughoutEnabled}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setMetronomeClickThroughoutEnabled(eventChecked(event))}
+                  >
+                    Click throughout practice, not just the one-bar count-in before it starts
+                  </SlCheckbox>
+                ) : null}
+
+                {trackingMode === "metronome" ? (
+                  <SlCheckbox
+                    size="small"
+                    checked={bowAttackDetectionEnabled}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setBowAttackDetectionEnabled(eventChecked(event))}
+                  >
+                    Bow attack detection (let a real bow attack shift the note boundary early/late,
+                    off by default -- the cursor otherwise advances strictly on the beat, with no
+                    dependency on detected pitch/onsets at all)
+                  </SlCheckbox>
+                ) : null}
+
+                {trackingMode !== "listening" ? (
+                  <SlSelect
+                    size="small"
+                    label="Click unit (what the tempo counts)"
+                    hoist
+                    style={{ maxWidth: "26em", marginTop: 8 }}
+                    value={clickSubdivision}
+                    disabled={practiceMode !== "off"}
+                    onSlChange={(event) => setClickSubdivision(eventValue(event) as ClickSubdivision)}
+                  >
+                    <SlOption value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</SlOption>
+                    <SlOption value="quarter">Quarter note</SlOption>
+                    <SlOption value="dottedQuarter">Dotted quarter (compound meter)</SlOption>
+                    <SlOption value="eighth">Eighth note</SlOption>
+                    <SlOption value="sixteenth">Sixteenth note (one click per note in Schradieck)</SlOption>
+                  </SlSelect>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={fuzzySequenceMatchingEnabled} onSlChange={(event) => setFuzzySequenceMatchingEnabled(eventChecked(event))}>
+                    Dev: fuzzy sequence matching (gap-tolerant resync, off by default -- see
+                    ScoreFollowerConfig.fuzzySequenceMatchingEnabled)
+                  </SlCheckbox>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
+                  <SlInput
+                    size="small"
+                    type="number"
+                    label="Dev: max consecutive missed notes a resync can bridge"
+                    helpText="Default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips"
+                    min={1}
+                    max={5}
+                    value={String(fuzzySequenceMaxSkips)}
+                    onSlInput={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(eventValue(event)) || 1))}
+                    style={{ maxWidth: "26em" }}
+                  />
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={adaptiveStabilityWindowEnabled} onSlChange={(event) => setAdaptiveStabilityWindowEnabled(eventChecked(event))}>
+                    Dev: adaptive stability window (tempo-scaled implicit-onset timing, off by
+                    default -- see ScoreFollowerConfig.adaptiveStabilityWindowEnabled)
+                  </SlCheckbox>
+                ) : null}
+
+                {practiceMode === "off" && config.showDevOptions && trackingMode === "listening" ? (
+                  <SlCheckbox size="small" checked={energyOnsetFusionEnabled} onSlChange={(event) => setEnergyOnsetFusionEnabled(eventChecked(event))}>
+                    Dev: energy onset fusion (adds a second onset detector + extra settle time on
+                    single-detector onsets, off by default -- see
+                    ScoreFollowerConfig.energyOnsetFusionEnabled). Takes effect on the NEXT
+                    microphone start, not while it's already running -- stop and restart the mic
+                    above after changing this.
+                  </SlCheckbox>
+                ) : null}
+
+                <SlCheckbox size="small" checked={autoScrollEnabled} onSlChange={(event) => handleAutoScrollChange(eventChecked(event))}>
+                  Auto-scroll to follow the music
+                </SlCheckbox>
+
+                <SlRadioGroup
+                  size="small"
+                  label="Grade against"
+                  name="grade-reference"
+                  className="inline-group"
+                  value={gradeReference}
+                  onSlChange={(event) => chooseGradeReference(eventValue(event) === "own" ? "own" : "a440")}
+                >
+                  <SlRadioButton value="a440">A440</SlRadioButton>
+                  <SlRadioButton value="own">My own tuning</SlRadioButton>
+                </SlRadioGroup>
+
+                <SlRadioGroup
+                  size="small"
+                  label="Strictness"
+                  name="grade-strictness"
+                  className="inline-group"
+                  value={gradeStrictness}
+                  onSlChange={(event) => chooseStrictness(eventValue(event) as GradeStrictness)}
+                >
+                  {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
+                    <SlRadioButton key={key} value={key}>
+                      {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
+                    </SlRadioButton>
+                  ))}
+                </SlRadioGroup>
+              </SlDrawer>
+
+              {practiceMode === "off" && !spotEnabled && scoreCursor ? (
                 <div style={styles.diagnosticHint}>
-                  Tracking mode:{" "}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "listening"}
-                      onChange={() => setTrackingMode("listening")}
-                    />{" "}
-                    Listening (pitch/onset-driven)
-                  </label>{" "}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "matchmaker"}
-                      onChange={() => setTrackingMode("matchmaker")}
-                    />{" "}
-                    Matchmaker (alignment server, recommended)
-                  </label>{" "}
-                  <label>
-                    <input
-                      type="radio"
-                      name="trackingMode"
-                      checked={trackingMode === "metronome"}
-                      onChange={() => setTrackingMode("metronome")}
-                    />{" "}
-                    Metronome (tempo-driven, no pitch tracking)
-                  </label>
+                  {startPoint && startMarker ? (
+                    <>
+                      Starts at bar {startMarker.barNumber} (▶ on the score) ·{" "}
+                      <SlButton variant="text" size="small" onClick={() => setStartPoint(null)}>
+                        Start from the beginning
+                      </SlButton>
+                      {trackingMode !== "matchmaker" ? " · only used in Matchmaker mode" : ""}
+                    </>
+                  ) : (
+                    "Tip: tap a note on the score to start practising from there."
+                  )}
                 </div>
               ) : null}
 
               {trackingMode === "matchmaker" && practiceMode === "off" && !spotNextPassPending ? (
                 <div style={{ ...styles.diagnosticHint, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={spotEnabled}
-                      onChange={(event) => {
-                        setSpotEnabled(event.target.checked);
-                        if (!event.target.checked) handleStopLooping();
-                      }}
-                    />{" "}
+                  <SlCheckbox
+                    size="small"
+                    checked={spotEnabled}
+                    onSlChange={(event) => {
+                      const enabled = eventChecked(event);
+                      setSpotEnabled(enabled);
+                      if (!enabled) handleStopLooping();
+                    }}
+                  >
                     Loop a passage (spot practice)
-                  </label>
+                  </SlCheckbox>
                   {spotEnabled ? (
                     <>
-                      <label>
-                        bars{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          aria-label="First bar to loop"
-                          value={spotFromInput}
-                          onChange={(event) => setSpotFromInput(event.target.value)}
-                          style={{ width: 56 }}
-                        />
-                      </label>
-                      <label>
-                        to{" "}
-                        <input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          aria-label="Last bar to loop"
-                          value={spotToInput}
-                          onChange={(event) => setSpotToInput(event.target.value)}
-                          style={{ width: 56 }}
-                        />
-                      </label>
                       <span>
                         {spotAwaitingEnd
-                          ? "Tap the last bar to loop (or start now to loop just this bar)."
-                          : "Tap a bar on the score to start choosing, or type the bars."}{" "}
+                          ? `Bar ${printedBar(Number.parseInt(spotFromInput, 10))} picked: tap the last bar to loop (or start now to loop just this bar).`
+                          : spotFromInput && spotToInput
+                            ? `Looping bars ${printedBar(Number.parseInt(spotFromInput, 10))}–${printedBar(Number.parseInt(spotToInput, 10))}; tap a bar to choose again.`
+                            : "Tap the first bar to loop on the score."}{" "}
                         Each pass is graded when you play past the last bar or stop; the next one starts when you play again.
                       </span>
                     </>
@@ -1532,7 +2057,7 @@ export default function App(): ReactElement {
               {activeSpotRegion && (spotPasses.length > 0 || practiceMode !== "off" || spotNextPassPending) ? (
                 <div style={styles.diagnosticHint}>
                   <strong>
-                    Looping bars {activeSpotRegion.fromBar}–{activeSpotRegion.toBar}
+                    Looping bars {printedBar(activeSpotRegion.fromBar)}–{printedBar(activeSpotRegion.toBar)}
                     {practiceMode !== "off" ? ` · pass ${spotPasses.length + 1}` : ""}
                     {spotNextPassPending ? " · next pass starting…" : ""}
                   </strong>
@@ -1548,9 +2073,9 @@ export default function App(): ReactElement {
                     </ol>
                   ) : null}
                   {spotNextPassPending ? (
-                    <button type="button" style={styles.secondaryButton} onClick={handleStopLooping}>
+                    <SlButton size="small" pill onClick={handleStopLooping}>
                       Stop looping
-                    </button>
+                    </SlButton>
                   ) : null}
                 </div>
               ) : null}
@@ -1579,7 +2104,9 @@ export default function App(): ReactElement {
                     <>
                       {" "}
                       · audio chunks sent {matchmakerLive.chunksSent} · matched the score {matchmakerLive.framesAccepted} · ignored as not-the-score{" "}
-                      {matchmakerLive.framesRejected} · positions received {matchmakerLive.positionsReceived}
+                      {matchmakerLive.framesRejected}
+                      {matchmakerLive.framesSpeech > 0 ? ` (${matchmakerLive.framesSpeech} as talking)` : ""} · positions received{" "}
+                      {matchmakerLive.positionsReceived}
                       {matchmakerLive.lastQuarter !== null ? ` · server position ${matchmakerLive.lastQuarter.toFixed(2)} qn` : ""}
                       {matchmakerLive.stepIndex !== null ? ` · cursor on note #${matchmakerLive.stepIndex + 1}` : ""}
                       {matchmakerLive.latencyMs !== null ? ` · ${Math.round(matchmakerLive.latencyMs)}ms` : ""}
@@ -1607,126 +2134,31 @@ export default function App(): ReactElement {
                 </div>
               ) : null}
 
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  Tempo{" "}
-                  <input
-                    type="number"
-                    min={20}
-                    max={300}
-                    value={metronomeBpm}
-                    // Deliberately does NOT clamp here -- clamping on every keystroke fought typing
-                    // itself: entering "300" digit-by-digit passes through "3" first, which a
-                    // same-keystroke clamp immediately snaps up to 20 (Math.max(20, 3)), overwriting
-                    // the field before a second digit could ever be typed. Clamp only once, on blur,
-                    // once the user is actually done editing; handleStartPracticing also clamps
-                    // defensively before constructing the follower regardless of blur.
-                    onChange={(event) => setMetronomeBpm(Number(event.target.value))}
-                    onBlur={() => setMetronomeBpm((value) => Math.min(300, Math.max(20, value || 20)))}
-                    style={{ width: "4em" }}
-                  />{" "}
-                  BPM -- the cursor advances on this clock alone; detected pitch is only compared
-                  against whatever note is currently scheduled, never used to decide when to move.
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={metronomeClickThroughoutEnabled}
-                    onChange={(event) => setMetronomeClickThroughoutEnabled(event.target.checked)}
-                  />{" "}
-                  Click throughout practice, not just the one-bar count-in before it starts
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={bowAttackDetectionEnabled}
-                    onChange={(event) => setBowAttackDetectionEnabled(event.target.checked)}
-                  />{" "}
-                  Bow attack detection (let a real bow attack shift the note boundary early/late,
-                  off by default -- the cursor otherwise advances strictly on the beat, with no
-                  dependency on detected pitch/onsets at all)
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "metronome" ? (
-                <label style={styles.diagnosticHint}>
-                  Click subdivision{" "}
-                  <select
-                    value={clickSubdivision}
-                    onChange={(event) => setClickSubdivision(event.target.value as ClickSubdivision)}
-                  >
-                    <option value="auto">Auto (quarter, or dotted-quarter for 6/8, 9/8, 12/8, ...)</option>
-                    <option value="quarter">Quarter note</option>
-                    <option value="dottedQuarter">Dotted quarter (compound meter)</option>
-                    <option value="eighth">Eighth note</option>
-                  </select>
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={fuzzySequenceMatchingEnabled}
-                    onChange={(event) => setFuzzySequenceMatchingEnabled(event.target.checked)}
-                  />{" "}
-                  Dev: fuzzy sequence matching (gap-tolerant resync, off by default -- see
-                  ScoreFollowerConfig.fuzzySequenceMatchingEnabled)
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "listening" && fuzzySequenceMatchingEnabled ? (
-                <label style={styles.diagnosticHint}>
-                  Dev: max consecutive missed notes a resync can bridge{" "}
-                  <input
-                    type="number"
-                    min={1}
-                    max={5}
-                    value={fuzzySequenceMaxSkips}
-                    onChange={(event) => setFuzzySequenceMaxSkips(Math.max(1, Number(event.target.value) || 1))}
-                    style={{ width: "3em" }}
-                  />{" "}
-                  (default 1 -- see ScoreFollowerConfig.fuzzySequenceMaxSkips)
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={adaptiveStabilityWindowEnabled}
-                    onChange={(event) => setAdaptiveStabilityWindowEnabled(event.target.checked)}
-                  />{" "}
-                  Dev: adaptive stability window (tempo-scaled implicit-onset timing, off by
-                  default -- see ScoreFollowerConfig.adaptiveStabilityWindowEnabled)
-                </label>
-              ) : null}
-
-              {practiceMode === "off" && trackingMode === "listening" ? (
-                <label style={styles.diagnosticHint}>
-                  <input
-                    type="checkbox"
-                    checked={energyOnsetFusionEnabled}
-                    onChange={(event) => setEnergyOnsetFusionEnabled(event.target.checked)}
-                  />{" "}
-                  Dev: energy onset fusion (adds a second onset detector + extra settle time on
-                  single-detector onsets, off by default -- see
-                  ScoreFollowerConfig.energyOnsetFusionEnabled). Takes effect on the NEXT
-                  microphone start, not while it's already running -- stop and restart the mic
-                  above after changing this.
-                </label>
-              ) : null}
-
               {renderError ? <div style={styles.errorBox}>Could not render this score: {renderError}</div> : null}
 
-              <div style={{ position: "relative", marginTop: 16 }}>
+              <div
+                style={{ position: "relative", marginTop: 16, cursor: !spotEnabled && scoreCursor && (practiceMode === "off" || (practiceMode === "active" && trackingMode === "matchmaker")) ? "pointer" : "default" }}
+                onClick={handleScoreClick}
+              >
                 <div ref={scoreContainerRef} style={styles.scoreContainer} />
+                {startMarker && practiceMode === "off" ? (
+                  <div
+                    aria-label={`Practice starts at bar ${startMarker.barNumber}`}
+                    style={{
+                      position: "absolute",
+                      left: startMarker.left,
+                      top: startMarker.top,
+                      width: startMarker.width,
+                      height: startMarker.height,
+                      background: "rgba(76, 178, 255, 0.22)",
+                      borderLeft: "3px solid #2f8fff",
+                      borderRadius: 4,
+                      pointerEvents: "none"
+                    }}
+                  >
+                    <span style={styles.startMarkerLabel}>▶ Start</span>
+                  </div>
+                ) : null}
                 {measureBoxes.length > 0 ? (
                   <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }} aria-label="Bars to loop">
                     {measureBoxes.map((box) => {
@@ -1738,7 +2170,7 @@ export default function App(): ReactElement {
                         <button
                           key={box.measureIndex}
                           type="button"
-                          aria-label={`Bar ${bar}`}
+                          aria-label={`Bar ${box.barNumber}`}
                           aria-pressed={selected}
                           disabled={!spotSelecting}
                           onClick={() => handleSpotBarTap(box.measureIndex)}
@@ -1761,21 +2193,6 @@ export default function App(): ReactElement {
                   </div>
                 ) : null}
               </div>
-
-              {practiceMode === "active" && followerState?.current ? (
-                <div style={styles.readoutGrid}>
-                  <div style={styles.readoutCard}>
-                    <div style={styles.readoutLabel}>Current note</div>
-                    <div style={styles.readoutValueLarge}>{followerState.current.pitchLabel ?? "--"}</div>
-                    <div style={styles.diagnosticHint}>Measure {followerState.current.measureIndex + 1}</div>
-                  </div>
-                  <div style={styles.readoutCard}>
-                    <div style={styles.readoutLabel}>Intonation</div>
-                    <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
-                    <div style={styles.diagnosticHint}>{formatCents(liveCentsFromExpected)} vs. expected</div>
-                  </div>
-                </div>
-              ) : null}
 
               {followerState?.status === "scoring" ? (
                 <div style={styles.importResult}>
@@ -1801,70 +2218,36 @@ export default function App(): ReactElement {
                       : ""}
                     {sessionSummary.averageCentsError.toFixed(1)} cents average error.
                   </p>
-                  <div style={styles.diagnosticHint} role="radiogroup" aria-label="Grade against">
-                    Grade against:{" "}
-                    <label>
-                      <input
-                        type="radio"
-                        name="grade-reference"
-                        checked={gradeReference === "own"}
-                        onChange={() => setGradeReference("own")}
-                      />{" "}
-                      my own tuning
-                    </label>{" "}
-                    <label>
-                      <input
-                        type="radio"
-                        name="grade-reference"
-                        checked={gradeReference === "a440"}
-                        onChange={() => setGradeReference("a440")}
-                      />{" "}
-                      A440
-                    </label>
+                  <div style={styles.diagnosticHint}>
+                    Graded against{" "}
                     {gradeReference === "own" && sessionSummary.referenceSource !== "a440"
-                      ? ` — your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${
-                          sessionSummary.referenceCents >= 0 ? "+" : ""
-                        }${sessionSummary.referenceCents.toFixed(0)}¢ from A440`
-                      : ""}
-                    .
+                      ? `your own tuning (your ${sessionSummary.referenceSource === "open_strings" ? "open strings" : "playing overall"} sat ${formatSignedCents(sessionSummary.referenceCents)} from A440)`
+                      : "A440"}
+                    , {STRICTNESS_BANDS[gradeStrictness].label.toLowerCase()} (change in Settings):{" "}
+                    <span style={{ color: "#8ee8cb" }}>green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
+                    <span style={{ color: "#ffb020" }}>amber</span> up to ±{STRICTNESS_BANDS[gradeStrictness].closeCents}¢,{" "}
+                    <span style={{ color: "#ff4d4d" }}>red</span> beyond, <span style={{ color: "#a07ee0" }}>purple</span> too fast or
+                    unclear to measure, <span style={{ color: "#9aa0a6" }}>grey</span> not played.
                   </div>
                   {sessionSummary.stringDriftCents !== null && Math.abs(sessionSummary.stringDriftCents) > 8 ? (
                     <p style={{ ...styles.diagnosticHint, color: "#ffb020" }}>
                       Your open strings were about {Math.abs(sessionSummary.stringDriftCents).toFixed(0)}¢{" "}
                       {sessionSummary.stringDriftCents < 0 ? "flat" : "sharp"} of your fingered notes. They may have
                       drifted: retune before the next take
-                      {gradeReference === "own" ? ', or grade against A440 so fingered notes aren\'t marked off because of it' : ""}.
+                      {gradeReference === "own" ? ', or grade against A440 (Settings) so fingered notes aren\'t marked off because of it' : ""}.
                     </p>
                   ) : null}
-                  <div style={styles.diagnosticHint} role="radiogroup" aria-label="Strictness">
-                    Strictness:{" "}
-                    {(Object.keys(STRICTNESS_BANDS) as GradeStrictness[]).map((key) => (
-                      <label key={key} style={{ marginRight: 10 }}>
-                        <input
-                          type="radio"
-                          name="grade-strictness"
-                          checked={gradeStrictness === key}
-                          onChange={() => chooseStrictness(key)}
-                        />{" "}
-                        {STRICTNESS_BANDS[key].label} (±{STRICTNESS_BANDS[key].inTuneCents}¢)
-                      </label>
-                    ))}
-                    <br />
-                    <span style={{ color: "#8ee8cb" }}>Green</span> within ±{STRICTNESS_BANDS[gradeStrictness].inTuneCents}¢,{" "}
-                    <span style={{ color: "#ffb020" }}>amber</span> up to ±{STRICTNESS_BANDS[gradeStrictness].closeCents}¢,{" "}
-                    <span style={{ color: "#ff4d4d" }}>red</span> beyond, <span style={{ color: "#a07ee0" }}>purple</span> too fast or
-                    unclear to measure, <span style={{ color: "#9aa0a6" }}>grey</span> not played.
-                  </div>
                   {finalScoringSource === "live" ? (
                     <p style={styles.diagnosticHint}>
                       Approximate: the full-recording analysis didn't finish, so this uses the live estimate.
                     </p>
                   ) : null}
-                  <div style={styles.buttonRow}>
-                    {takeAvailable && lastTakeRef.current ? (
-                      <button
-                        type="button"
-                        style={styles.secondaryButton}
+                  {archivedTakeId ? <p style={styles.diagnosticHint}>Saved on the server as take {archivedTakeId}.</p> : null}
+                  {takeAvailable && lastTakeRef.current ? (
+                    <div style={styles.buttonRow}>
+                      <SlButton
+                        size="small"
+                        pill
                         onClick={() => {
                           const saved = lastTakeRef.current;
                           if (!saved || !followerState) return;
@@ -1881,14 +2264,91 @@ export default function App(): ReactElement {
                         }}
                       >
                         Download this take
-                      </button>
-                    ) : null}
-                    <button type="button" style={styles.primaryButton} onClick={() => handleStartPracticing()}>
-                      Practice again
-                    </button>
-                  </div>
+                      </SlButton>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
+            </div>
+
+            {/* Practice controls and the live readout: a column beside the score that stays in view
+                while the page scrolls (position: sticky). Always present once a score is loaded, so
+                starting a take never changes the score's width (which would re-lay it out mid-take). */}
+            <aside style={styles.practiceSidebar} aria-label="Practice controls">
+              <div style={styles.sidebarButtons}>
+                {/* Distinct keys: these replace one another in the same spot, and a reused element kept
+                    Practice!'s "disabled" (set while the microphone starts), so End Practice ignored taps. */}
+                {practiceMode === "active" ? (
+                  <SlButton
+                    key="end"
+                    className="end-button"
+                    variant="danger"
+                    size="large"
+                    pill
+                    style={{ flex: 1 }}
+                    onClick={() => {
+                      handleStopLooping();
+                      handleEndPracticing();
+                    }}
+                  >
+                    {activeSpotRegion ? "Stop looping" : "End Practice"}
+                  </SlButton>
+                ) : practiceMode === "counting_in" ? (
+                  <SlButton key="cancel" size="large" pill style={{ flex: 1 }} onClick={handleCancelCountIn}>
+                    {trackingMode === "matchmaker" ? "Preparing… (cancel)" : "Counting in… (cancel)"}
+                  </SlButton>
+                ) : (
+                  <SlButton
+                    key="practice"
+                    className="practice-button"
+                    variant="warning"
+                    size="large"
+                    pill
+                    style={{ flex: 1 }}
+                    onClick={handleRequestStartPracticing}
+                    disabled={!scoreCursor || isStarting || pendingAutoStartPractice}
+                  >
+                    {pendingAutoStartPractice || isStarting ? "Starting…" : "Practice!"}
+                  </SlButton>
+                )}
+                <SlButton size="large" circle aria-label="Settings" title="Settings" onClick={() => setSettingsOpen(true)}>
+                  ⚙&#xFE0E;
+                </SlButton>
+              </div>
+
+              {practiceMode === "off" ? (
+                <div style={styles.diagnosticHint}>
+                  {TRACKING_MODE_SHORT_LABELS[trackingMode]}
+                  {` · ${metronomeBpm} per ${TEMPO_UNIT_LABELS[resolveClickSubdivision(clickSubdivision, importResult?.score.timeSignature)]}`} · {gradeReference === "a440" ? "A440" : "own tuning"} ·{" "}
+                  {STRICTNESS_BANDS[gradeStrictness].label}
+                </div>
+              ) : null}
+
+              {practiceMode === "active" && followerState?.current ? (
+                <>
+                  <div style={styles.readoutCard}>
+                    <div style={styles.readoutLabel}>Current note</div>
+                    <div style={styles.readoutValueLarge}>{followerState.current.pitchLabel ?? "--"}</div>
+                    <div style={styles.diagnosticHint}>Measure {followerState.current.measureIndex + 1}</div>
+                  </div>
+                  <div style={styles.readoutCard}>
+                    <div style={styles.readoutLabel}>Intonation</div>
+                    <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
+                    <div style={styles.diagnosticHint}>
+                      {liveBetweenNotes
+                        ? `heard ${captureState.note ?? "another pitch"}, sheet says ${followerState.current.pitchLabel ?? "—"} (or the cursor is behind)`
+                        : liveIntonation === null
+                          ? "—"
+                          : `${formatCents(liveIntonation)} vs. ${followerState.current.pitchLabel ?? "expected"}`}
+                    </div>
+                  </div>
+                </>
+              ) : null}
+
+              {practiceMode === "active" && trackingMode === "matchmaker" && followerState?.status === "in_progress" && !spotEnabled ? (
+                <div style={styles.diagnosticHint}>{jumpMessage ?? "Lost? Tap the note you're on to jump there."}</div>
+              ) : null}
+            </aside>
             </div>
           ) : null}
         </section>
@@ -1901,82 +2361,36 @@ const styles: Record<string, CSSProperties> = {
   page: {
     minHeight: "100vh",
     display: "grid",
-    placeItems: "center",
-    padding: "24px"
+    placeItems: "start center",
+    padding: "12px"
   },
   shell: {
     width: "100%",
     maxWidth: "920px"
   },
-  heroCard: {
-    position: "relative",
-    overflow: "hidden",
-    borderRadius: "28px",
-    border: "1px solid rgba(255, 255, 255, 0.12)",
-    background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
-    boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "28px"
-  },
-  topRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: "16px",
-    alignItems: "start",
-    marginBottom: "28px"
-  },
-  kicker: {
-    margin: 0,
-    textTransform: "uppercase",
-    letterSpacing: "0.2em",
-    fontSize: "12px",
-    color: "rgba(204, 214, 232, 0.72)"
-  },
-  title: {
-    margin: "8px 0 0",
-    fontSize: "clamp(2.4rem, 4vw, 4.25rem)",
-    lineHeight: 1,
-    letterSpacing: "-0.04em"
+  // The Practice tab is wider by the control column, so the score keeps its width on a laptop.
+  shellWide: {
+    width: "100%",
+    maxWidth: "1140px"
   },
   statusPill: {
     display: "inline-flex",
     alignItems: "center",
     borderRadius: "999px",
-    padding: "10px 14px",
-    fontSize: "13px",
+    padding: "6px 10px",
+    fontSize: "12px",
     fontWeight: 600,
     border: "1px solid rgba(255, 255, 255, 0.12)"
   },
-  readoutGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-    gap: "16px"
-  },
-  diagnosticsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: "16px",
-    marginTop: "16px"
-  },
   readoutCard: {
-    borderRadius: "20px",
-    padding: "18px",
+    borderRadius: "14px",
+    padding: "12px",
     background: "rgba(255, 255, 255, 0.03)",
     border: "1px solid rgba(255, 255, 255, 0.08)",
-    minHeight: "122px",
+    minHeight: "84px",
     display: "flex",
     flexDirection: "column",
     justifyContent: "space-between"
-  },
-  diagnosticCard: {
-    borderRadius: "20px",
-    padding: "18px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: "1px solid rgba(255, 255, 255, 0.08)",
-    minHeight: "138px",
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-    gap: "10px"
   },
   readoutLabel: {
     color: "rgba(204, 214, 232, 0.7)",
@@ -1985,39 +2399,49 @@ const styles: Record<string, CSSProperties> = {
     textTransform: "uppercase"
   },
   readoutValueLarge: {
-    fontSize: "clamp(2.2rem, 6vw, 4.6rem)",
+    fontSize: "clamp(1.6rem, 4vw, 2.8rem)",
     fontWeight: 700,
     letterSpacing: "-0.05em"
   },
   readoutValue: {
-    fontSize: "clamp(1.15rem, 2.3vw, 1.6rem)",
+    fontSize: "clamp(1rem, 2vw, 1.3rem)",
     fontWeight: 600,
     letterSpacing: "-0.03em"
-  },
-  meterTrack: {
-    width: "100%",
-    height: "10px",
-    borderRadius: "999px",
-    background: "rgba(255, 255, 255, 0.06)",
-    overflow: "hidden"
-  },
-  meterFill: {
-    height: "100%",
-    borderRadius: "inherit",
-    background: "linear-gradient(90deg, #4cb2ff 0%, #8ee8cb 100%)",
-    boxShadow: "0 0 18px rgba(76, 178, 255, 0.45)"
   },
   diagnosticHint: {
     color: "rgba(204, 214, 232, 0.68)",
     fontSize: "13px",
     lineHeight: 1.4
   },
+  // Practice tab once a score is loaded: score column + a control column that sticks in view.
+  practiceLayout: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) 200px",
+    gap: "14px",
+    alignItems: "start",
+    marginTop: "8px"
+  },
+  practiceMain: {
+    minWidth: 0
+  },
+  practiceSidebar: {
+    position: "sticky",
+    top: "12px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px"
+  },
+  sidebarButtons: {
+    display: "flex",
+    gap: "8px",
+    alignItems: "center"
+  },
   metaRow: {
     display: "grid",
     gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-    gap: "12px",
-    marginTop: "18px",
-    padding: "18px 0 4px"
+    gap: "10px",
+    marginTop: "10px",
+    padding: "8px 0 2px"
   },
   metaLabel: {
     color: "rgba(204, 214, 232, 0.66)",
@@ -2026,84 +2450,48 @@ const styles: Record<string, CSSProperties> = {
     letterSpacing: "0.08em"
   },
   metaValue: {
-    marginTop: "6px",
-    fontSize: "15px",
-    fontWeight: 600
-  },
-  deviceLabel: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "8px",
-    marginTop: "18px",
-    color: "rgba(204, 214, 232, 0.7)",
-    fontSize: "12px",
-    textTransform: "uppercase",
-    letterSpacing: "0.08em",
-    maxWidth: "360px"
-  },
-  deviceSelect: {
-    font: "inherit",
-    textTransform: "none",
-    letterSpacing: "normal",
+    marginTop: "4px",
     fontSize: "14px",
-    padding: "10px 12px",
-    borderRadius: "12px",
-    background: "rgba(255, 255, 255, 0.04)",
-    border: "1px solid rgba(255, 255, 255, 0.14)",
-    color: "#f5f7fb"
+    fontWeight: 600
   },
   buttonRow: {
     display: "flex",
     flexWrap: "wrap",
-    gap: "12px",
-    marginTop: "24px"
-  },
-  primaryButton: {
-    border: "none",
-    borderRadius: "999px",
-    padding: "14px 20px",
-    background: "linear-gradient(135deg, #8ee8cb 0%, #4cb2ff 100%)",
-    color: "#06111d",
-    fontWeight: 700,
-    cursor: "pointer"
+    gap: "8px",
+    marginTop: "12px"
   },
   secondaryButton: {
     border: "1px solid rgba(255, 255, 255, 0.14)",
     borderRadius: "999px",
-    padding: "14px 20px",
+    padding: "8px 14px",
+    fontSize: "14px",
     background: "rgba(255, 255, 255, 0.04)",
     color: "#f5f7fb",
     fontWeight: 600,
     cursor: "pointer"
   },
   errorBox: {
-    marginTop: "18px",
-    padding: "14px 16px",
-    borderRadius: "16px",
+    marginTop: "10px",
+    padding: "8px 12px",
+    borderRadius: "10px",
     background: "rgba(255, 77, 77, 0.12)",
     border: "1px solid rgba(255, 77, 77, 0.24)",
     color: "#ffd0d0"
   },
   caption: {
-    margin: "20px 0 0",
+    margin: "12px 0 0",
     color: "rgba(204, 214, 232, 0.68)",
     lineHeight: 1.55,
     maxWidth: "68ch"
   },
   importCard: {
     position: "relative",
-    overflow: "hidden",
-    borderRadius: "28px",
+    overflow: "clip", // not "hidden": that would stop the control column sticking
+    borderRadius: "18px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
     boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "28px",
-    marginTop: "24px"
-  },
-  subtitle: {
-    margin: "8px 0 0",
-    fontSize: "clamp(1.4rem, 2.4vw, 2rem)",
-    letterSpacing: "-0.03em"
+    padding: "16px"
   },
   hiddenFileInput: {
     position: "absolute",
@@ -2117,14 +2505,7 @@ const styles: Record<string, CSSProperties> = {
     border: 0
   },
   importResult: {
-    marginTop: "18px"
-  },
-  correctionPanel: {
-    marginTop: "18px",
-    padding: "16px",
-    borderRadius: "16px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: "1px solid rgba(255, 255, 255, 0.08)"
+    marginTop: "8px"
   },
   correctionRow: {
     display: "flex",
@@ -2133,37 +2514,19 @@ const styles: Record<string, CSSProperties> = {
     alignItems: "center",
     marginTop: "8px"
   },
+  startMarkerLabel: {
+    position: "absolute",
+    top: "-17px",
+    left: "-3px",
+    fontSize: "11px",
+    fontWeight: 700,
+    color: "#2f8fff",
+    whiteSpace: "nowrap"
+  },
   scoreContainer: {
     background: "#f7f4ee",
-    borderRadius: "16px",
-    padding: "16px",
+    borderRadius: "10px",
+    padding: "6px",
     overflowX: "auto"
-  }
-};
-
-const statusStyles: Record<LiveCaptureState["status"], CSSProperties> = {
-  idle: {
-    background: "rgba(255, 255, 255, 0.04)",
-    color: "rgba(245, 247, 251, 0.8)"
-  },
-  requesting: {
-    background: "rgba(111, 191, 255, 0.14)",
-    color: "#bfe7ff"
-  },
-  calibrating: {
-    background: "rgba(255, 193, 109, 0.16)",
-    color: "#ffe0aa"
-  },
-  listening: {
-    background: "rgba(107, 232, 180, 0.16)",
-    color: "#bff4df"
-  },
-  suspended: {
-    background: "rgba(255, 208, 109, 0.16)",
-    color: "#ffe3a2"
-  },
-  error: {
-    background: "rgba(255, 84, 84, 0.16)",
-    color: "#ffb3b3"
   }
 };

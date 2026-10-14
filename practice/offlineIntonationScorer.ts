@@ -59,6 +59,21 @@ export interface OfflineScoringConfig {
 // The post-take alignment is accurate to about one 33 ms frame, so the last few ms of a note's
 // aligned span may already belong to the next note.
 const SPAN_END_GUARD_SECONDS = 0.015;
+// Pizzicato (2026-10-13): a plucked note is loud for its first ~100 ms and has decayed to almost
+// nothing long before its written length ends, so a whole-span measurement (which also skips the
+// first 40 ms and takes the middle of a long span) found no pitch and graded the real pizzicato
+// takes "unclear". And the aligned start of a plucked note is often a second away from the pluck
+// itself (nothing but a faint ring tells the aligner where a note begins inside a run of
+// repeated notes), so the window can't be anchored at the start either. A span whose loudest
+// moment stands PLUCK_TRANSIENT_RATIO above its median level and has decayed below
+// PLUCK_DECAY_RATIO of it PLUCK_DECAY_SECONDS later is a pluck: it is measured over the
+// PLUCK_WINDOW_SECONDS from that peak. A bowed note holds its level, so it never matches.
+const PLUCK_TRANSIENT_RATIO = 4;
+const PLUCK_DECAY_SECONDS = 0.3;
+const PLUCK_DECAY_RATIO = 0.3;
+const PLUCK_WINDOW_SECONDS = 0.25;
+const PLUCK_ATTACK_LEAD_SECONDS = 0.01;
+const PLUCK_SCAN_MAX_SECONDS = 8;
 
 // How densely the recording is analyzed. The live tuner analyzes every 512 samples (~11 ms) for
 // low latency; grading doesn't need that -- each note is summarized by the median of its readings.
@@ -289,8 +304,9 @@ async function scoreInformed(
     // attack (harness section 5), so on a short note -- where a fixed 40 ms would leave almost
     // nothing to measure -- it shrinks to a fifth of the span.
     const settleSeconds = Math.min(config.settleMs / 1000, 0.2 * (endSeconds - startSeconds));
-    const from = Math.round((startSeconds + settleSeconds) * sampleRate);
-    const to = Math.min(recordedAudio.length, Math.round((endSeconds - SPAN_END_GUARD_SECONDS) * sampleRate));
+    const pluck = pluckWindow(recordedAudio, sampleRate, startSeconds, endSeconds);
+    const from = Math.round((pluck ? pluck[0] : startSeconds + settleSeconds) * sampleRate);
+    const to = Math.min(recordedAudio.length, Math.round((pluck ? pluck[1] : endSeconds - SPAN_END_GUARD_SECONDS) * sampleRate));
     const record = records[stepIndex];
     if (to > from) {
       const segment = new Float32Array(to - from);
@@ -367,6 +383,34 @@ function splitRepeatedNoteRuns(
     }
     i = j + 1;
   }
+}
+
+// The [from, to] seconds to measure when the span holds a pluck (see PLUCK_TRANSIENT_RATIO), else
+// null. Spans shorter than the decay check are measured whole either way.
+function pluckWindow(audio: Float32Array, sampleRate: number, startSeconds: number, endSeconds: number): [number, number] | null {
+  if (endSeconds - startSeconds < PLUCK_DECAY_SECONDS + 0.05) return null;
+  const levels: number[] = [];
+  let peak = 0;
+  let peakAt = startSeconds;
+  for (let t = startSeconds; t <= Math.min(endSeconds, startSeconds + PLUCK_SCAN_MAX_SECONDS); t += ENVELOPE_HOP_SECONDS) {
+    const level = rmsAt(audio, sampleRate, t);
+    levels.push(level);
+    if (level > peak) {
+      peak = level;
+      peakAt = t;
+    }
+  }
+  if (peak <= 0 || levels.length < 3) return null;
+  const sorted = [...levels].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  if (peak < PLUCK_TRANSIENT_RATIO * median) return null;
+  if (peakAt + PLUCK_DECAY_SECONDS + 0.1 > endSeconds) return null;
+  let later = 0;
+  for (let t = peakAt + PLUCK_DECAY_SECONDS; t <= peakAt + PLUCK_DECAY_SECONDS + 0.1; t += ENVELOPE_HOP_SECONDS) {
+    later = Math.max(later, rmsAt(audio, sampleRate, t));
+  }
+  if (later >= PLUCK_DECAY_RATIO * peak) return null;
+  return [Math.max(startSeconds, peakAt - PLUCK_ATTACK_LEAD_SECONDS), Math.min(endSeconds, peakAt + PLUCK_WINDOW_SECONDS)];
 }
 
 function rmsAt(audio: Float32Array, sampleRate: number, centreSeconds: number): number {

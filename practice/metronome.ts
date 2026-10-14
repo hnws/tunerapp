@@ -69,9 +69,22 @@ export function computeTimeSignatureSegments(measures: ReadonlyArray<{ timeSigna
 // as "didn't work at all," not just "counted wrong"), which is why this needs to be a real choice
 // rather than always auto-derived: a piece with genuinely notated-against-the-quarter phrasing in
 // a compound meter, or a user who just prefers a different click density, can override it.
-export type ClickSubdivision = "auto" | "quarter" | "dottedQuarter" | "eighth";
+export type ClickSubdivision = "auto" | "quarter" | "dottedQuarter" | "eighth" | "sixteenth";
+export type ResolvedClickSubdivision = Exclude<ClickSubdivision, "auto">;
+
+// Quarter notes per click for a resolved subdivision.
+export const CLICK_SUBDIVISION_QUARTERS: Record<ResolvedClickSubdivision, number> = {
+  sixteenth: 0.25,
+  eighth: 0.5,
+  quarter: 1,
+  dottedQuarter: 1.5
+};
 
 export interface MetronomeConfig {
+  // Clicks per minute -- of the click unit (clickSubdivision, resolved against the opening meter
+  // when "auto"), not always of a quarter note: "sixteenth = 60" is one click per sixteenth,
+  // the way a Schradieck exercise is practised (2026-10-11: the family's metronome at 60 clicks
+  // once per note, and this clock used to click four notes per click at "60").
   tempoBpm: number;
   // The piece's full sequence of meter changes (see computeTimeSignatureSegments()) -- used for
   // the count-in bar's duration (always the first segment's signature, since the count-in
@@ -91,10 +104,10 @@ export interface MetronomeConfig {
 // quarter. Anything else (2/4, 3/4, 4/4, 2/2, 5/8 non-compound groupings, ...) defaults to a
 // plain quarter, which is what this app's BPM already means everywhere else (ScoreDocument.tempoBpm,
 // MetronomeScoreFollower's own scheduling).
-function resolveClickSubdivision(
+export function resolveClickSubdivision(
   subdivision: ClickSubdivision,
   timeSignature: string | undefined | null
-): "quarter" | "dottedQuarter" | "eighth" {
+): ResolvedClickSubdivision {
   if (subdivision !== "auto") {
     return subdivision;
   }
@@ -118,8 +131,10 @@ function resolveClickSubdivision(
 // changes with clickSubdivision, never the underlying scheduling precision.
 const FINE_SUBDIVISIONS_PER_QUARTER = 4;
 
-function fineTicksPerClick(subdivision: "quarter" | "dottedQuarter" | "eighth"): number {
+function fineTicksPerClick(subdivision: ResolvedClickSubdivision): number {
   switch (subdivision) {
+    case "sixteenth":
+      return 1;
     case "eighth":
       return FINE_SUBDIVISIONS_PER_QUARTER / 2;
     case "dottedQuarter":
@@ -197,11 +212,12 @@ interface SegmentRuntime {
 const SEGMENT_LOOKUP_EPSILON = 1e-6;
 
 export function createBeatClock(config: MetronomeConfig): BeatClock {
-  const secondsPerQuarterNote = msPerBeat(config) / 1000;
-  const secondsPerFineTick = secondsPerQuarterNote / FINE_SUBDIVISIONS_PER_QUARTER;
-
   const sortedSegments = [...config.timeSignatureSegments].sort((a, b) => a.startQuarterNote - b.startQuarterNote);
   const effectiveSegments = sortedSegments.length > 0 ? sortedSegments : [{ startQuarterNote: 0, timeSignature: "4/4" }];
+  // tempoBpm counts clicks of the opening meter's click unit (see MetronomeConfig).
+  const openingUnit = resolveClickSubdivision(config.clickSubdivision, effectiveSegments[0].timeSignature);
+  const secondsPerQuarterNote = (msPerBeat(config) / 1000) / CLICK_SUBDIVISION_QUARTERS[openingUnit];
+  const secondsPerFineTick = secondsPerQuarterNote / FINE_SUBDIVISIONS_PER_QUARTER;
   // Per-segment click/downbeat parameters, precomputed once up front rather than per-tick --
   // each segment gets its own resolved subdivision (so "auto" mode correctly switches between
   // plain and dotted-quarter clicks as the piece moves between simple and compound meters) and

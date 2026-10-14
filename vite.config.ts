@@ -20,6 +20,13 @@ const PROXY_ROUTES = {
 
 export default defineConfig({
   plugins: [basicSsl()],
+  build: {
+    // Vite 8's default minifier (oxc) broke OpenSheetMusicDisplay once Shoelace joined the bundle:
+    // every score failed to render with OSMD's {message: "clefType"} exception (its clef lookup was
+    // mis-minified), while the unminified build rendered fine. esbuild's minifier doesn't have the
+    // problem; re-test score rendering before switching back.
+    minify: "esbuild"
+  },
   server: {
     https: true,
     host: true,

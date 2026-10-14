@@ -31,6 +31,8 @@ from matchmaker.io.audio import BytesAudioStream, set_latency_stats
 from matchmaker.io.stream import STREAM_END
 from partitura.score import Part
 
+from speech_detector import SpeechDetector
+
 logger = logging.getLogger("matchmaker_service")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,23 +122,34 @@ def convert_beat_to_quarter(score_part: Part, beat: float) -> float:
     return float(score_part.quarter_map(timeline_time))
 
 
-def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
-    """True when one pitch class stands out in a chroma frame -- see REJECT_CHROMA_FLATNESS."""
+def chroma_flatness(chroma_frame: np.ndarray) -> float:
+    """mean / peak of a chroma frame: 1/12 for a single pitch class, 1 for a flat spectrum. Digital
+    silence normalizes to an all-zero vector, whose mean is 0 -- maximally "peaked" by the
+    measure, so it is reported as flat."""
     chroma = np.asarray(chroma_frame, dtype=np.float32).reshape(-1)
     peak = float(chroma.max()) if chroma.size else 0.0
-    # Digital silence normalizes to an all-zero vector, whose mean is 0 -- maximally "peaked" by
-    # the flatness measure, so it needs its own check.
-    return peak > 0.0 and float(chroma.mean()) / peak <= REJECT_CHROMA_FLATNESS
+    return 1.0 if peak <= 0.0 else float(chroma.mean()) / peak
+
+
+def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
+    """True when one pitch class stands out in a chroma frame -- see REJECT_CHROMA_FLATNESS."""
+    return chroma_flatness(chroma_frame) <= REJECT_CHROMA_FLATNESS
 
 
 # The tonality test above lets anything with a clear pitch through, and so did talking (voiced
 # speech is tonal: flatness 0.15-0.45 on three TTS voices, inside the violin's 0.12-0.29) and the
 # ring of the open strings after the violin is bumped. Both walked the cursor forward and left the
-# notes they passed graded "unclear" (live report, 2026-10-08). PlayingGate adds three checks, set
-# on TTS speech and synthetic bumps (.scratch/gate_sim.py) and checked against real violin -- the
-# dev recordings and the user's two takes -- for how much playing they'd throw away:
-# - Energy below the violin's range (60-180 Hz; open G is 196 Hz): voiced male speech has its
-#   fundamental there, violin has nothing there at all (ratio 0.00 at the 95th percentile).
+# notes they passed graded "unclear" (live report, 2026-10-08). PlayingGate adds three checks:
+# - Talking: Silero VAD's speech probability for the frame (server/speech_detector.py). A frame
+#   above SPEECH_PROBABILITY and the SPEECH_HANGOVER_FRAMES after it (the model trails the end of
+#   a word) are treated like noise. This replaced a "energy at 60-180 Hz" test for a male voice's
+#   fundamental, which, measured on a lesson recording from the room the app is used in
+#   (2026-10-11), rejected 39% of the violin frames (quiet G-string playing over room rumble) and
+#   still passed female speech. On the same clips -- 4 min each of the child's playing, the
+#   teacher talking, both at once, and the gaps between -- the gate kept: violin 48% -> 78% of
+#   frames (57% -> 88% of the loud ones), talking 3.9% -> 1.9%, talking over playing 18% (same;
+#   those frames are now dropped as speech rather than as low-band). Hangover 6 vs 0: talking
+#   2.7% -> 1.9%, violin unchanged.
 # - To START accepting after a break, PLAYING_GATE_OPEN_FRAMES (~130 ms) of steady pitch class
 #   (consecutive chroma cosine >= PLAYING_GATE_STABILITY) whose level isn't falling: a bowed note
 #   holds its pitch and level, speech glides between syllables, and a bump's ring decays from the
@@ -145,35 +158,45 @@ def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
 #   closing any tonal frame reopens it: a single non-tonal frame mid-passage (a string crossing, a
 #   scratchy bow change) shouldn't make fast playing re-earn the steady-pitch test -- without this
 #   it cost 1.5 s of a fast Corrente passage. Kept short because speech reuses it between
-#   syllables (0.5 s let a flat TTS voice through 65% of the time; 100 ms, 47%). A "must keep
-#   finding steady stretches to stay open" rule was also tried and never fired on anything the
-#   opening test hadn't already stopped.
-# Measured: violin frames kept 99.8% (fast Bach) and 98.8-99.6% (user takes); male TTS 0%, two
-# female TTS voices 11% and 47% (the 47% is a flat-prosody voice; real speech moves pitch more);
-# synthetic bumps 0%. Accepted speech frames still move the cursor, so this is fewer false
-# advances, not none.
+#   syllables. A "must keep finding steady stretches to stay open" rule was also tried and never
+#   fired on anything the opening test hadn't already stopped.
+# Earlier measurements (TTS speech and synthetic bumps, .scratch/gate_sim.py): violin frames kept
+# 99.8% (fast Bach) and 98.8-99.6% (user takes); synthetic bumps 0%. Accepted speech frames still
+# move the cursor, so this is fewer false advances, not none.
+# - Pizzicato (2026-10-13): a pluck halves in 30-50 ms, so by the fourth frame its level has
+#   fallen far below the opening test's 0.9 ratio, and because the gate closes in the silence
+#   between plucks every pluck had to re-earn it -- the real pizzicato takes of 2026-10-13 had
+#   26% / 36% of their plucks accepted and graded almost nothing. A second way to open: a pluck
+#   is one string sounding alone, so its chroma is strongly peaked (flatness ~0.23 median on
+#   those takes, 0.41 p90 right after the attack), while a bump rings several open strings at
+#   once (synthetic knock + four strings: 0.40-0.43) and speech sits at 0.35. So
+#   PLAYING_GATE_PLUCK_FRAMES of steady pitch class whose flatness stays <= PLAYING_GATE_PLUCK_FLATNESS
+#   open the gate whether or not the level is falling. Measured (tools/dsp/gate_pluck.py on the
+#   lesson clips + the two takes + the bump clip): plucks caught 26% -> 80% (45 s take), bump
+#   unchanged (40% of knocks, 13% of their frames -- the same frames the old rule let through),
+#   speech 2.5% -> 3.9% of frames, violin 79% -> 87%. 0.35 would have let 80% of the bumps in;
+#   shortening the steady-level test to two frames instead would have too.
 PLAYING_GATE_OPEN_FRAMES = 4
 PLAYING_GATE_STABILITY = 0.9
 PLAYING_GATE_OPEN_LEVEL_RATIO = 0.9
+PLAYING_GATE_PLUCK_FRAMES = 2
+PLAYING_GATE_PLUCK_FLATNESS = 0.30
 PLAYING_GATE_RESUME_FRAMES = 3
-PLAYING_GATE_LOW_BAND_MAX = 0.05
 PLAYING_GATE_BACKFILL_FRAMES = 15
+SPEECH_PROBABILITY = 0.5
+SPEECH_HANGOVER_FRAMES = 6
 
 
-def frame_band_stats(power: np.ndarray, sample_rate: int, n_fft: int) -> tuple[np.ndarray, np.ndarray]:
-    """(low-band ratio, rms) per frame from an STFT power array shaped (frames, bins)."""
-    freqs = np.fft.rfftfreq(n_fft, 1.0 / sample_rate)
-    low = power[:, (freqs > 60) & (freqs < 180)].sum(axis=1)
-    band = power[:, (freqs >= 180) & (freqs < 4000)].sum(axis=1) + 1e-12
-    rms = np.sqrt(power.sum(axis=1) / n_fft)
-    return low / band, rms
+def frame_rms(power: np.ndarray, n_fft: int) -> np.ndarray:
+    """RMS per frame from an STFT power array shaped (frames, bins)."""
+    return np.sqrt(power.sum(axis=1) / n_fft)
 
 
 class PlayingGate:
     """Decides, frame by frame, whether the input is the violin being played -- see above.
 
-    ``push`` takes one frame (an opaque item plus its chroma vector, low-band ratio and rms) and
-    returns the items to pass on now: usually [] or [item], and on opening, the run of frames that
+    ``push`` takes one frame (an opaque item plus its chroma vector, rms and speech probability)
+    and returns the items to pass on now: usually [] or [item], and on opening, the run of frames that
     led up to it. Used by both the live stream and the post-take alignment so both see the same
     frames.
     """
@@ -182,7 +205,9 @@ class PlayingGate:
         self.open = False
         self.accepted = 0
         self.rejected = 0
-        self._recent: list[tuple[bool, np.ndarray, float]] = []  # (tonal, unit chroma, rms)
+        self.rejected_as_speech = 0
+        self._speech_hangover = 0
+        self._recent: list[tuple[bool, np.ndarray, float, float]] = []  # (tonal, unit chroma, rms, flatness)
         self._pending: list[object] = []  # tonal frames seen while closed, newest last
         self._since_closed = PLAYING_GATE_RESUME_FRAMES + 1
 
@@ -190,15 +215,22 @@ class PlayingGate:
         if len(self._recent) < k:
             return False
         window = self._recent[-k:]
-        if not all(tonal for tonal, _, _ in window):
+        if not all(entry[0] for entry in window):
             return False
         return all(float(a[1] @ b[1]) >= PLAYING_GATE_STABILITY for a, b in zip(window, window[1:]))
 
-    def push(self, item: object, chroma_frame: np.ndarray, low_ratio: float, rms: float) -> list:
+    def push(self, item: object, chroma_frame: np.ndarray, rms: float, speech_probability: float = 0.0) -> list:
         chroma = np.asarray(chroma_frame, dtype=np.float32).reshape(-1)
-        tonal = is_tonal_frame(chroma) and low_ratio <= PLAYING_GATE_LOW_BAND_MAX
+        if speech_probability > SPEECH_PROBABILITY:
+            self._speech_hangover = SPEECH_HANGOVER_FRAMES + 1
+        speech = self._speech_hangover > 0
+        self._speech_hangover = max(0, self._speech_hangover - 1)
+        if speech:
+            self.rejected_as_speech += 1
+        flat = chroma_flatness(chroma)
+        tonal = flat <= REJECT_CHROMA_FLATNESS and not speech
         unit = chroma / (float(np.linalg.norm(chroma)) + 1e-9)
-        self._recent.append((tonal, unit, float(rms)))
+        self._recent.append((tonal, unit, float(rms), flat))
         del self._recent[:-PLAYING_GATE_OPEN_FRAMES]
 
         if not self.open:
@@ -211,12 +243,14 @@ class PlayingGate:
             if len(self._pending) > PLAYING_GATE_BACKFILL_FRAMES:
                 self._pending.pop(0)
                 self.rejected += 1
-            levels = [r for _, _, r in self._recent]
+            levels = [r for _, _, r, _ in self._recent]
             resuming = self._since_closed <= PLAYING_GATE_RESUME_FRAMES
             self._since_closed += 1
-            if resuming or (
-                self._stable(PLAYING_GATE_OPEN_FRAMES) and levels[-1] >= PLAYING_GATE_OPEN_LEVEL_RATIO * max(levels)
-            ):
+            steady = self._stable(PLAYING_GATE_OPEN_FRAMES) and levels[-1] >= PLAYING_GATE_OPEN_LEVEL_RATIO * max(levels)
+            pluck = self._stable(PLAYING_GATE_PLUCK_FRAMES) and all(
+                f <= PLAYING_GATE_PLUCK_FLATNESS for _, _, _, f in self._recent[-PLAYING_GATE_PLUCK_FRAMES:]
+            )
+            if resuming or steady or pluck:
                 self.open = True
                 released, self._pending = self._pending, []
                 self.accepted += len(released)
@@ -395,12 +429,15 @@ class _PatientBytesAudioStream(BytesAudioStream):
     """
 
     gate: PlayingGate
+    speech: SpeechDetector
 
     def _process_feature(self, target_audio: np.ndarray, f_time: float) -> None:
         # The library's version (matchmaker.io.audio) with PlayingGate between the processor and
         # the follower's queue. Same framing: the first block is zero-padded and its frame dropped.
         if not hasattr(self, "gate"):
             self.gate = PlayingGate()
+            self.speech = SpeechDetector(self.sample_rate)
+        speech_probability = self.speech.push(target_audio)
         if self.last_chunk is None:
             target_audio = np.concatenate((np.zeros(self.cache_size, dtype=np.float32), target_audio))
         else:
@@ -412,8 +449,8 @@ class _PatientBytesAudioStream(BytesAudioStream):
             n_fft = self.processor.n_fft
             frame = target_audio[-n_fft:] * np.hanning(n_fft + 1)[:-1].astype(np.float32)
             power = (np.abs(np.fft.rfft(frame)) ** 2)[None, :]
-            low, rms = frame_band_stats(power, self.sample_rate, n_fft)
-            for released in self.gate.push(output, output[0][-1], float(low[0]), float(rms[0])):
+            rms = frame_rms(power, n_fft)
+            for released in self.gate.push(output, output[0][-1], float(rms[0]), speech_probability):
                 self.queue.put(released)
         latency = time.time() - self.last_data_received
         self.latency_stats = set_latency_stats(latency, self.latency_stats, self.input_index)
@@ -523,7 +560,7 @@ class _StreamingMatchmaker(Matchmaker):
         return np.asarray(self.score_part.beat_map(timeline), dtype=float)
 
     def preprocess_score(self):
-        cache_key = f"{self._cache_key}:{REFERENCE_SYNTH}"
+        cache_key = f"{self._cache_key}:{REFERENCE_SYNTH}:{self.tempo}"
         with _reference_cache_lock:
             cached = _reference_cache.get(cache_key)
             if cached is not None:
@@ -610,6 +647,12 @@ class LiveAligner:
         self._recorded_samples += len(payload) // 4
         self.data_queue.put(payload)
 
+    def recorded_audio(self) -> np.ndarray:
+        """Everything the browser sent this session, as float32 samples."""
+        if not self._recorded_chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(b"".join(self._recorded_chunks), dtype=np.float32)
+
     def quarter_to_ref_frame(self, quarter: float) -> int:
         part = self.score_part
         quarter = min(max(quarter, self.quarter_origin), self.total_quarters)
@@ -669,11 +712,18 @@ class LiveAligner:
         # Same PlayingGate as the live stream, so talking or a bump in the take isn't aligned to
         # notes here either.
         power = np.abs(librosa.stft(audio, n_fft=processor.n_fft, hop_length=processor.hop_length, center=False)).T ** 2
-        low, rms = frame_band_stats(power[: features.shape[0]], self.sample_rate, processor.n_fft)
+        rms = frame_rms(power[: features.shape[0]], processor.n_fft)
+        # Speech probability per hop, fed the same way the live stream feeds its detector (one hop
+        # at a time, states carried), so both passes see the same frames as talking. Live frame i
+        # was gated with the probability after hop i + 1 (the first hop only primes the stream).
+        hop = processor.hop_length
+        speech = SpeechDetector(self.sample_rate)
+        hop_probabilities = [speech.push(audio[k * hop:(k + 1) * hop]) for k in range(audio.size // hop)]
         gate = PlayingGate()
         tonal = []
-        for i in range(min(features.shape[0], low.shape[0])):
-            tonal.extend(gate.push(i, features[i], float(low[i]), float(rms[i])))
+        for i in range(min(features.shape[0], rms.shape[0])):
+            probability = hop_probabilities[min(i + 1, len(hop_probabilities) - 1)] if hop_probabilities else 0.0
+            tonal.extend(gate.push(i, features[i], float(rms[i]), probability))
         if len(tonal) < 2:
             return []
 
@@ -755,10 +805,10 @@ class LiveAligner:
         times = (frame_indices[perf_frames] * hop + centre_offset) / self.sample_rate
         return [(float(t), float(q)) for t, q in zip(times, quarters)]
 
-    def frame_stats(self) -> tuple[int, int]:
-        """(accepted, rejected) live frames so far -- see PlayingGate."""
+    def frame_stats(self) -> tuple[int, int, int]:
+        """(accepted, rejected, rejected as talking) live frames so far -- see PlayingGate."""
         gate = getattr(self.matchmaker.stream, "gate", None)
-        return (gate.accepted, gate.rejected) if gate is not None else (0, 0)
+        return (gate.accepted, gate.rejected, gate.rejected_as_speech) if gate is not None else (0, 0, 0)
 
     def push_sentinel(self) -> None:
         """Unblock the worker thread's pending ``queue.get()`` so it can exit.

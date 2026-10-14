@@ -7,3 +7,6 @@ python-multipart
 # verified. Pulls in partitura (which bundles its own soundfont, so no separate Fluidsynth install
 # has been needed on this dev machine) and librosa.
 pymatchmaker @ git+https://github.com/pymatchmaker/matchmaker.git@v0.3.0
+# Silero VAD (models/silero_vad.onnx, MIT) tells the playing gate when someone is talking -- see
+# speech_detector.py. CPU build; ~3 ms per second of audio.
+onnxruntime

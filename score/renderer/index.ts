@@ -1,4 +1,4 @@
-import { OpenSheetMusicDisplay } from "opensheetmusicdisplay";
+import { OpenSheetMusicDisplay, PointF2D } from "opensheetmusicdisplay";
 import { applyAutomaticBeaming } from "./beamGrouping";
 import { applyTimeSignatureCorrection } from "./timeSignatureCorrection";
 import { createScoreCursor, type ScoreCursor } from "./scoreCursor";
@@ -11,10 +11,33 @@ export interface RenderedScoreHandle {
   // Where each bar is drawn, in pixels relative to the container passed to renderScore -- for
   // tapping bars on the score (spot practice). Read fresh each time: OSMD re-lays out on resize.
   getMeasureBoxes(): MeasureBox[];
+  // The note (or rest) nearest a click, in viewport coordinates (MouseEvent.clientX/Y), or null
+  // when nothing is close. Its position is in quarter notes from the start of the piece -- the
+  // same units as ScoreCursor.buildQuarterIndex(), so it can be matched against that index.
+  noteAt(clientX: number, clientY: number): { quarter: number } | null;
+  // Where to draw a marker for the staff entry at `quarter` (a thin column over its bar's staff,
+  // relative to the container, like getMeasureBoxes), plus the printed bar number. Read fresh
+  // after every re-layout.
+  markerAt(quarter: number): StartMarkerBox | null;
 }
+
+export interface StartMarkerBox {
+  barNumber: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+// How far from a note a click still counts as that note, in OSMD units (a staff is 4 units tall).
+const NOTE_CLICK_TOLERANCE = new PointF2D(2.5, 5);
+const QUARTER_EPSILON = 1e-6;
 
 export interface MeasureBox {
   measureIndex: number;
+  // The bar number printed on the sheet (differs from measureIndex + 1 when the file starts
+  // mid-piece or leaves bars out).
+  barNumber: number;
   left: number;
   top: number;
   width: number;
@@ -190,6 +213,7 @@ export async function renderScore(
         const bottom = Math.max(...shapes.map((b) => b.AbsolutePosition.y + b.BorderBottom)) + 2;
         boxes.push({
           measureIndex,
+          barNumber: staves.find((measure) => measure?.parentSourceMeasure)?.parentSourceMeasure.getPrintedMeasureNumber() ?? measureIndex + 1,
           left: offsetX + left * scale,
           top: offsetY + top * scale,
           width: (right - left) * scale,
@@ -197,6 +221,45 @@ export async function renderScore(
         });
       });
       return boxes;
+    },
+    noteAt(clientX, clientY) {
+      const sheet = osmd.GraphicSheet;
+      if (!sheet) return null;
+      // DOM (client) -> SVG user space -> OSMD units, OSMD's own conversion helpers.
+      const point = sheet.svgToOsmd(sheet.domToSvg(new PointF2D(clientX, clientY)));
+      const note = sheet.GetNearestNote(point, NOTE_CLICK_TOLERANCE);
+      const timestamp = note?.sourceNote?.getAbsoluteTimestamp();
+      return timestamp ? { quarter: timestamp.RealValue * 4 } : null;
+    },
+    markerAt(quarter) {
+      const svg = container.querySelector("svg");
+      const sheet = osmd.GraphicSheet;
+      if (!svg || !sheet) return null;
+      const svgRect = svg.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const scale = OSMD_UNIT_PX * osmd.zoom;
+      for (const staves of sheet.MeasureList) {
+        for (const measure of staves) {
+          if (!measure?.PositionAndShape) continue;
+          const entry = measure.staffEntries.find(
+            (candidate) => Math.abs(candidate.getAbsoluteTimestamp().RealValue * 4 - quarter) < QUARTER_EPSILON
+          );
+          if (!entry) continue;
+          const bar = measure.PositionAndShape;
+          const x = entry.PositionAndShape.AbsolutePosition.x;
+          const top = bar.AbsolutePosition.y + bar.BorderTop - 2;
+          const bottom = bar.AbsolutePosition.y + bar.BorderBottom + 2;
+          return {
+            // The number printed on the sheet (a practice file can start at bar 23), not OSMD's count.
+            barNumber: measure.parentSourceMeasure.getPrintedMeasureNumber(),
+            left: svgRect.left - containerRect.left + (x - 1.2) * scale,
+            top: svgRect.top - containerRect.top + top * scale,
+            width: 2.4 * scale,
+            height: (bottom - top) * scale
+          };
+        }
+      }
+      return null;
     },
     unmount() {
       osmd.clear();

@@ -102,6 +102,7 @@ export class MetronomeScoreFollower {
   private status: ScoreFollowerState["status"] = "idle";
   private current: CursorNoteInfo | null = null;
   private liveCentsOffFromExpected: number | null = null;
+  private liveHeardAtMs: number | null = null;
   private lastPitchReason: LivePitchFrame["reason"] = null;
   private history: NoteAccuracyRecord[] = [];
   private activeRecord: NoteAccuracyRecord | null = null;
@@ -184,11 +185,17 @@ export class MetronomeScoreFollower {
       }
     }
 
+    if (clickMasked || frame.isSilent || frame.frequencyHz === null || this.current.primaryFrequencyHz === null) {
+      return this.emit();
+    }
+
+    // Shown live whatever it is (see MatchmakerScoreFollower.onLiveFrame); only plausible
+    // readings are graded.
+    const cents = centsOff(frame.frequencyHz, this.current.primaryFrequencyHz);
+    this.liveCentsOffFromExpected = cents;
+    this.liveHeardAtMs = performance.now();
+
     if (
-      clickMasked ||
-      frame.isSilent ||
-      frame.frequencyHz === null ||
-      this.current.primaryFrequencyHz === null ||
       !isPlausibleReading(
         frame.frequencyHz,
         frame.confidence,
@@ -200,9 +207,6 @@ export class MetronomeScoreFollower {
     ) {
       return this.emit();
     }
-
-    const cents = centsOff(frame.frequencyHz, this.current.primaryFrequencyHz);
-    this.liveCentsOffFromExpected = cents;
 
     if (performance.now() - this.currentNoteStartedAtMs >= this.config.onsetSettleMs) {
       this.activeRecord?.centsOffSamples.push(cents);
@@ -224,6 +228,7 @@ export class MetronomeScoreFollower {
       status: this.status,
       current: this.current,
       liveCentsOffFromExpected: this.liveCentsOffFromExpected,
+      liveHeardAtMs: this.liveHeardAtMs,
       history: this.history,
       lastPitchReason: this.lastPitchReason
     };
