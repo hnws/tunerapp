@@ -8,6 +8,8 @@ import {
 } from "../audio/captureModule";
 import { importPhotoToScore, type OmrImportResult } from "../score/omrImport";
 import { DEFAULT_APP_CONFIG, type AppConfig, type TrackingModeId } from "./appConfig";
+import { TunerPanel } from "./TunerPanel";
+import { statusStyles } from "./captureStatus";
 import { SlButton, SlCheckbox, SlDetails, SlDrawer, SlInput, SlOption, SlRadioButton, SlRadioGroup, SlSelect, SlTab, SlTabGroup, eventChecked, eventValue, isOwnEvent } from "./ui";
 import { importMusicXmlToScore } from "../score/musicxmlImport";
 import { applyNoteCorrectionsToXml } from "../score/correctionUI/noteXmlCorrection";
@@ -82,17 +84,8 @@ const LIVE_CAPTURE_OPTIONS: StartCaptureOptions = {
   channelCount: 1
 };
 
-function formatConfidence(value: number): string {
-  return `${(value * 100).toFixed(0)}%`;
-}
 
-function formatFrequency(value: number | null): string {
-  if (value === null) {
-    return "--";
-  }
 
-  return `${value.toFixed(2)} Hz`;
-}
 
 function formatCents(value: number | null): string {
   if (value === null) {
@@ -156,23 +149,6 @@ function formatSignedCents(cents: number): string {
   return `${rounded > 0 ? "+" : ""}${rounded === 0 ? 0 : rounded}¢`;
 }
 
-function statusLabel(status: LiveCaptureState["status"]): string {
-  switch (status) {
-    case "requesting":
-      return "Requesting microphone";
-    case "calibrating":
-      return "Calibrating";
-    case "listening":
-      return "Listening";
-    case "suspended":
-      return "Paused";
-    case "error":
-      return "Error";
-    case "idle":
-    default:
-      return "Idle";
-  }
-}
 
 export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfig }): ReactElement {
   const controllerRef = useRef<MicrophoneCaptureController | null>(null);
@@ -1536,9 +1512,6 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
       });
   }
 
-  const noteDisplay = captureState.isSilent || captureState.frequencyHz === null ? "No note" : captureState.note ?? "--";
-  const pitchClass = captureState.isSilent ? "idle" : captureState.note ? "active" : "searching";
-  const levelRatio = captureState.silenceRmsThreshold > 0 ? Math.min(1, captureState.rms / captureState.silenceRmsThreshold) : 0;
 
   // Live intonation readout. The raw per-frame value compares the detected pitch with the note the
   // live cursor is on at that instant, which in fast passages is often the neighbouring note (the
@@ -1676,113 +1649,19 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
           ))}
         </SlTabGroup>
 
-        <section style={activeTab === "tuner" ? styles.heroCard : { ...styles.heroCard, display: "none" }}>
-          <div style={styles.topRow}>
-            <div>
-              <p style={styles.kicker}>Live violin tuner</p>
-              <h1 style={styles.title}>TunerApp</h1>
-            </div>
-            <span style={{ ...styles.statusPill, ...statusStyles[captureState.status] }}>{statusLabel(captureState.status)}</span>
-          </div>
-
-          <div style={styles.readoutGrid}>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Note</div>
-              <div style={styles.readoutValueLarge} data-state={pitchClass}>
-                {noteDisplay}
-              </div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Frequency</div>
-              <div style={styles.readoutValue}>{formatFrequency(captureState.frequencyHz)}</div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Cents off</div>
-              <div style={styles.readoutValue}>{formatCents(captureState.centsOff)}</div>
-            </div>
-            <div style={styles.readoutCard}>
-              <div style={styles.readoutLabel}>Confidence</div>
-              <div style={styles.readoutValue}>{formatConfidence(captureState.confidence)}</div>
-            </div>
-          </div>
-
-          <div style={styles.diagnosticsGrid}>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Live RMS</div>
-              <div style={styles.readoutValue}>{captureState.rms.toFixed(4)}</div>
-              <div style={styles.meterTrack} aria-hidden="true">
-                <div style={{ ...styles.meterFill, width: `${Math.max(6, levelRatio * 100)}%` }} />
-              </div>
-              <div style={styles.diagnosticHint}>{captureState.isSilent ? "Silence floor" : "Bow energy detected"}</div>
-            </div>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Target threshold</div>
-              <div style={styles.readoutValue}>{captureState.silenceRmsThreshold.toFixed(4)}</div>
-              <div style={styles.diagnosticHint}>Auto-calibrated from startup noise</div>
-            </div>
-            <div style={styles.diagnosticCard}>
-              <div style={styles.readoutLabel}>Gain</div>
-              <div style={styles.readoutValue}>{captureState.gainScalar.toFixed(1)}x Boost</div>
-              <div style={styles.diagnosticHint}>Software gain for weak microphones</div>
-            </div>
-          </div>
-
-          <div style={styles.metaRow}>
-            <div>
-              <div style={styles.metaLabel}>Sample rate</div>
-              <div style={styles.metaValue}>{captureState.sampleRate > 0 ? `${captureState.sampleRate} Hz` : "--"}</div>
-            </div>
-            <div>
-              <div style={styles.metaLabel}>Noise gate</div>
-              <div style={styles.metaValue}>{captureState.isSilent ? "Silent" : `RMS ${captureState.rms.toFixed(4)}`}</div>
-            </div>
-            <div>
-              <div style={styles.metaLabel}>Frame</div>
-              <div style={styles.metaValue}>{captureState.frameSize} / {captureState.hopSize}</div>
-            </div>
-          </div>
-
-          <div style={styles.metaRow}>
-            <div>
-              <div style={styles.metaLabel}>Active microphone</div>
-              <div style={styles.metaValue}>{captureState.activeDeviceLabel ?? "--"}</div>
-            </div>
-          </div>
-
-          <SlSelect
-            size="small"
-            label="Microphone"
-            style={{ marginTop: 12 }}
-            value={selectedDeviceId || SYSTEM_DEFAULT_DEVICE}
-            onSlChange={(event) => handleDeviceChange(eventValue(event))}
-            disabled={captureState.status === "listening" || captureState.status === "calibrating"}
-          >
-            <SlOption value={SYSTEM_DEFAULT_DEVICE}>System default</SlOption>
-            {inputDevices.map((device, index) => (
-              <SlOption key={device.deviceId || index} value={device.deviceId}>
-                {device.label || `Microphone ${index + 1}`}
-              </SlOption>
-            ))}
-          </SlSelect>
-
-          {captureState.error ? <div style={styles.errorBox}>{captureState.error.message}</div> : null}
-
-          <div style={styles.buttonRow}>
-            <SlButton variant="primary" size="small" pill onClick={handleStart} disabled={isStarting || captureState.status === "requesting"}>
-              {isStarting || captureState.status === "requesting" ? "Starting..." : "Start Microphone"}
-            </SlButton>
-            <SlButton size="small" pill onClick={handlePause} disabled={captureState.status !== "listening"}>
-              Pause
-            </SlButton>
-            <SlButton size="small" pill onClick={handleStop} disabled={captureState.status === "idle"}>
-              Stop
-            </SlButton>
-          </div>
-
-          <p style={styles.caption}>
-            Microphone processing is configured for violin acoustics with echo cancellation, noise suppression, and automatic gain control disabled.
-          </p>
-        </section>
+        <TunerPanel
+          hidden={activeTab !== "tuner"}
+          captureState={captureState}
+          isStarting={isStarting}
+          onStart={() => void handleStart()}
+          onPause={() => void handlePause()}
+          onStop={() => void handleStop()}
+          inputDevices={inputDevices}
+          selectedDeviceId={selectedDeviceId}
+          systemDefaultDevice={SYSTEM_DEFAULT_DEVICE}
+          onDeviceChange={handleDeviceChange}
+          config={config.tuner}
+        />
 
         <section style={activeTab === "practice" ? styles.importCard : { ...styles.importCard, display: "none" }}>
           {captureState.error ? <div style={styles.errorBox}>Microphone: {captureState.error.message}</div> : null}
@@ -2469,35 +2348,6 @@ const styles: Record<string, CSSProperties> = {
     width: "100%",
     maxWidth: "1140px"
   },
-  heroCard: {
-    position: "relative",
-    overflow: "hidden",
-    borderRadius: "18px",
-    border: "1px solid rgba(255, 255, 255, 0.12)",
-    background: "linear-gradient(180deg, rgba(12, 22, 37, 0.92), rgba(8, 14, 23, 0.96))",
-    boxShadow: "0 30px 80px rgba(0, 0, 0, 0.38)",
-    padding: "16px"
-  },
-  topRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: "10px",
-    alignItems: "start",
-    marginBottom: "14px"
-  },
-  kicker: {
-    margin: 0,
-    textTransform: "uppercase",
-    letterSpacing: "0.2em",
-    fontSize: "12px",
-    color: "rgba(204, 214, 232, 0.72)"
-  },
-  title: {
-    margin: "8px 0 0",
-    fontSize: "clamp(1.5rem, 3vw, 2.2rem)",
-    lineHeight: 1,
-    letterSpacing: "-0.04em"
-  },
   statusPill: {
     display: "inline-flex",
     alignItems: "center",
@@ -2506,17 +2356,6 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "12px",
     fontWeight: 600,
     border: "1px solid rgba(255, 255, 255, 0.12)"
-  },
-  readoutGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
-    gap: "10px"
-  },
-  diagnosticsGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-    gap: "10px",
-    marginTop: "10px"
   },
   readoutCard: {
     borderRadius: "14px",
@@ -2527,17 +2366,6 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     justifyContent: "space-between"
-  },
-  diagnosticCard: {
-    borderRadius: "14px",
-    padding: "12px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: "1px solid rgba(255, 255, 255, 0.08)",
-    minHeight: "90px",
-    display: "flex",
-    flexDirection: "column",
-    justifyContent: "space-between",
-    gap: "6px"
   },
   readoutLabel: {
     color: "rgba(204, 214, 232, 0.7)",
@@ -2554,19 +2382,6 @@ const styles: Record<string, CSSProperties> = {
     fontSize: "clamp(1rem, 2vw, 1.3rem)",
     fontWeight: 600,
     letterSpacing: "-0.03em"
-  },
-  meterTrack: {
-    width: "100%",
-    height: "10px",
-    borderRadius: "999px",
-    background: "rgba(255, 255, 255, 0.06)",
-    overflow: "hidden"
-  },
-  meterFill: {
-    height: "100%",
-    borderRadius: "inherit",
-    background: "linear-gradient(90deg, #4cb2ff 0%, #8ee8cb 100%)",
-    boxShadow: "0 0 18px rgba(76, 178, 255, 0.45)"
   },
   diagnosticHint: {
     color: "rgba(204, 214, 232, 0.68)",
@@ -2688,32 +2503,5 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: "10px",
     padding: "6px",
     overflowX: "auto"
-  }
-};
-
-const statusStyles: Record<LiveCaptureState["status"], CSSProperties> = {
-  idle: {
-    background: "rgba(255, 255, 255, 0.04)",
-    color: "rgba(245, 247, 251, 0.8)"
-  },
-  requesting: {
-    background: "rgba(111, 191, 255, 0.14)",
-    color: "#bfe7ff"
-  },
-  calibrating: {
-    background: "rgba(255, 193, 109, 0.16)",
-    color: "#ffe0aa"
-  },
-  listening: {
-    background: "rgba(107, 232, 180, 0.16)",
-    color: "#bff4df"
-  },
-  suspended: {
-    background: "rgba(255, 208, 109, 0.16)",
-    color: "#ffe3a2"
-  },
-  error: {
-    background: "rgba(255, 84, 84, 0.16)",
-    color: "#ffb3b3"
   }
 };

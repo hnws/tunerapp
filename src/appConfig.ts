@@ -10,6 +10,16 @@ export interface ScoreChoice {
   url: string;
 }
 
+export type ViolinStringId = "G" | "D" | "A" | "E";
+
+export interface TunerConfig {
+  // Frequency of A4 the open strings are tuned to.
+  referenceAHz: number;
+  // Strings with a fine tuner on the tailpiece; the Tuner tab tells the player to use it for small
+  // corrections and the peg otherwise. Student violins usually have all four.
+  fineTuners: ViolinStringId[];
+}
+
 export interface AppConfig {
   // Tracking modes offered on the Practice tab, in display order. "listening" (practice/cursor.ts's
   // ScoreFollower) is kept in the code but was never reliable live, so it's off by default.
@@ -27,6 +37,8 @@ export interface AppConfig {
   // Developer controls: the "auto-correct time signatures" import option and the listening-mode
   // tuning toggles.
   showDevOptions: boolean;
+  // The Tuner tab (open-string tuning guide).
+  tuner: TunerConfig;
 }
 
 export const DEFAULT_APP_CONFIG: AppConfig = {
@@ -35,8 +47,15 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
   defaultScore: "/scores/default.musicxml",
   scores: [],
   archiveTakes: false,
-  showDevOptions: false
+  showDevOptions: false,
+  tuner: { referenceAHz: 440, fineTuners: ["G", "D", "A", "E"] }
 };
+
+const VIOLIN_STRING_IDS: readonly ViolinStringId[] = ["G", "D", "A", "E"];
+
+function isViolinStringId(value: unknown): value is ViolinStringId {
+  return typeof value === "string" && (VIOLIN_STRING_IDS as readonly string[]).includes(value);
+}
 
 const TRACKING_MODE_IDS: readonly TrackingModeId[] = ["matchmaker", "metronome", "listening"];
 
@@ -46,7 +65,12 @@ function isTrackingMode(value: unknown): value is TrackingModeId {
 
 export function resolveAppConfig(raw: unknown): AppConfig {
   const source = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
-  const config: AppConfig = { ...DEFAULT_APP_CONFIG, trackingModes: [...DEFAULT_APP_CONFIG.trackingModes], scores: [] };
+  const config: AppConfig = {
+    ...DEFAULT_APP_CONFIG,
+    trackingModes: [...DEFAULT_APP_CONFIG.trackingModes],
+    scores: [],
+    tuner: { ...DEFAULT_APP_CONFIG.tuner, fineTuners: [...DEFAULT_APP_CONFIG.tuner.fineTuners] }
+  };
 
   if (Array.isArray(source.trackingModes)) {
     const modes = source.trackingModes.filter(isTrackingMode).filter((mode, index, all) => all.indexOf(mode) === index);
@@ -76,6 +100,16 @@ export function resolveAppConfig(raw: unknown): AppConfig {
   }
   if (typeof source.showDevOptions === "boolean") {
     config.showDevOptions = source.showDevOptions;
+  }
+  const tuner = source.tuner && typeof source.tuner === "object" ? (source.tuner as Record<string, unknown>) : null;
+  if (tuner) {
+    // A reference outside 400-480 Hz is a typo, not a tuning.
+    if (typeof tuner.referenceAHz === "number" && Number.isFinite(tuner.referenceAHz) && tuner.referenceAHz >= 400 && tuner.referenceAHz <= 480) {
+      config.tuner.referenceAHz = tuner.referenceAHz;
+    }
+    if (Array.isArray(tuner.fineTuners)) {
+      config.tuner.fineTuners = tuner.fineTuners.filter(isViolinStringId).filter((id, index, all) => all.indexOf(id) === index);
+    }
   }
   return config;
 }

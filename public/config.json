@@ -2,5 +2,6 @@
   "trackingModes": ["matchmaker", "metronome"],
   "defaultTrackingMode": "matchmaker",
   "defaultScore": "/scores/default.musicxml",
-  "showDevOptions": false
+  "showDevOptions": false,
+  "tuner": { "referenceAHz": 440, "fineTuners": ["G", "D", "A", "E"] }
 }
