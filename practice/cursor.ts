@@ -48,6 +48,9 @@ export interface ScoreFollowerState {
   // misleadingly "in tune" if the player is confidently on a wrong note). Null when there's no
   // current note or no usable pitch sample yet for it. Safe for live UI display.
   liveCentsOffFromExpected: number | null;
+  // performance.now() of the last live frame that carried a pitch while a note was current, so the
+  // UI can tell a fresh reading from one that's just been left on the screen. Null before the first.
+  liveHeardAtMs: number | null;
   history: NoteAccuracyRecord[];
   // Mirrors the most recent live frame's LivePitchFrame.reason -- purely diagnostic, does not
   // drive any resync/onset decision. Surfaces *why* a frame produced no usable pitch (silence vs.
@@ -455,6 +458,7 @@ export class ScoreFollower {
   private status: ScoreFollowerStatus = "idle";
   private current: CursorNoteInfo | null = null;
   private liveCentsOffFromExpected: number | null = null;
+  private liveHeardAtMs: number | null = null;
   private lastPitchReason: LivePitchFrame["reason"] = null;
   private history: NoteAccuracyRecord[] = [];
   private activeRecord: NoteAccuracyRecord | null = null;
@@ -602,6 +606,7 @@ export class ScoreFollower {
       ) {
         const cents = centsOff(frame.frequencyHz, this.current.primaryFrequencyHz);
         this.liveCentsOffFromExpected = cents;
+        this.liveHeardAtMs = performance.now();
 
         // Skip recording a sample while the watcher has an unresolved drift candidate open --
         // those readings are, by construction, more than implicitOnsetStabilityToleranceSemitones
@@ -1079,6 +1084,7 @@ export class ScoreFollower {
       status: this.status,
       current: this.current,
       liveCentsOffFromExpected: this.liveCentsOffFromExpected,
+      liveHeardAtMs: this.liveHeardAtMs,
       history: this.history,
       lastPitchReason: this.lastPitchReason
     };

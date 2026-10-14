@@ -69,6 +69,7 @@ export class MatchmakerScoreFollower {
   private status: ScoreFollowerState["status"] = "idle";
   private current: CursorNoteInfo | null = null;
   private liveCentsOffFromExpected: number | null = null;
+  private liveHeardAtMs: number | null = null;
   private lastPitchReason: LivePitchFrame["reason"] = null;
   // Keyed by stepIndex rather than appended to a list: alignment can revisit a note (the player
   // repeats a bar, or OLTW corrects an earlier overshoot backwards), and a revisit should keep
@@ -97,6 +98,7 @@ export class MatchmakerScoreFollower {
     this.current = this.cursor.reset();
     this.status = this.current ? "in_progress" : "completed";
     this.liveCentsOffFromExpected = null;
+    this.liveHeardAtMs = null;
     this.lastPitchReason = null;
     this.records = new Map();
     this.pendingFinalStatus = null;
@@ -175,10 +177,20 @@ export class MatchmakerScoreFollower {
 
     this.lastPitchReason = frame.reason;
 
+    if (frame.isSilent || frame.frequencyHz === null || this.current.primaryFrequencyHz === null) {
+      return this.emit();
+    }
+
+    // The live value is whatever is sounding against the cursor's note, plausible or not: a
+    // reading nowhere near the expected pitch is a different note (or a cursor that hasn't
+    // caught up), and the card has to say so rather than keep showing the previous note's
+    // verdict (parent's report, 2026-10-13: "in tune" stayed up while a wrong note sounded).
+    // Only plausible readings count towards the note's grade.
+    const cents = centsOff(frame.frequencyHz, this.current.primaryFrequencyHz);
+    this.liveCentsOffFromExpected = cents;
+    this.liveHeardAtMs = performance.now();
+
     if (
-      frame.isSilent ||
-      frame.frequencyHz === null ||
-      this.current.primaryFrequencyHz === null ||
       !isPlausibleReading(
         frame.frequencyHz,
         frame.confidence,
@@ -190,9 +202,6 @@ export class MatchmakerScoreFollower {
     ) {
       return this.emit();
     }
-
-    const cents = centsOff(frame.frequencyHz, this.current.primaryFrequencyHz);
-    this.liveCentsOffFromExpected = cents;
 
     if (performance.now() - this.currentNoteStartedAtMs >= this.config.onsetSettleMs) {
       this.records.get(this.current.stepIndex)?.centsOffSamples.push(cents);
@@ -268,6 +277,7 @@ export class MatchmakerScoreFollower {
       status: this.status,
       current: this.current,
       liveCentsOffFromExpected: this.liveCentsOffFromExpected,
+      liveHeardAtMs: this.liveHeardAtMs,
       history: this.buildHistory(),
       lastPitchReason: this.lastPitchReason
     };

@@ -62,6 +62,9 @@ const SCORE_STORAGE_KEY = "tunerapp.scoreUrl";
 const LIVE_READOUT_WINDOW = 6;
 const LIVE_READOUT_MIN_READINGS = 3;
 const LIVE_READOUT_BETWEEN_NOTES_CENTS = 100;
+// With no pitch heard for this long the card goes back to "Listening…" instead of keeping the
+// last note's verdict on the screen.
+const LIVE_READOUT_STALE_MS = 800;
 const OWN_FILE = "own-file"; // sl-option values can't be empty: stands for "a file you uploaded"
 // Auto-scroll keeps the cursor between these fractions of the viewport height and, when it
 // leaves that band, scrolls so it sits at AUTO_SCROLL_TARGET (a bit above the middle, so the
@@ -1517,11 +1520,22 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
   // live cursor is on at that instant, which in fast passages is often the neighbouring note (the
   // live cursor lags or leads by a note), so it used to read "Off pitch" most of the time on
   // correctly played notes (parent's report, 2026-10-11). Now: the median of the last few readings
-  // of the current note, judged with the Settings strictness band, and "Between notes" (not a
+  // of the current note, judged with the Settings strictness band, and "Different note" (not a
   // verdict) when the reading is nowhere near the expected pitch. The final colours after the
-  // take come from the post-take alignment and were never affected.
+  // take come from the post-take alignment and were never affected. Since 2026-10-13 the value
+  // always reflects what is sounding now: the followers report every pitched frame (implausible
+  // ones included) with a timestamp, and the card goes back to "Listening…" when nothing has
+  // been heard for LIVE_READOUT_STALE_MS -- before that a good note's "In tune" stayed up while
+  // a wrong note or silence followed (parent's report).
   const liveCentsFromExpected = followerState?.liveCentsOffFromExpected ?? null;
+  const liveHeardAtMs = followerState?.liveHeardAtMs ?? null;
   const liveStepIndex = followerState?.current?.stepIndex ?? null;
+  const [liveNowMs, setLiveNowMs] = useState(0);
+  useEffect(() => {
+    if (practiceMode !== "active") return;
+    const id = window.setInterval(() => setLiveNowMs(performance.now()), 250);
+    return () => window.clearInterval(id);
+  }, [practiceMode]);
   useEffect(() => {
     const readings = liveReadingsRef.current;
     if (practiceMode !== "active") {
@@ -1534,20 +1548,27 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
       readings.step = liveStepIndex;
       readings.values = [];
     }
-    if (liveCentsFromExpected === null) return;
+    if (liveCentsFromExpected === null || liveHeardAtMs === null) return;
     readings.values.push(liveCentsFromExpected);
     if (readings.values.length > LIVE_READOUT_WINDOW) readings.values.shift();
     if (readings.values.length < LIVE_READOUT_MIN_READINGS) return;
     const sorted = [...readings.values].sort((a, b) => a - b);
     setLiveIntonation(sorted[Math.floor(sorted.length / 2)]);
-  }, [liveCentsFromExpected, liveStepIndex, practiceMode]);
+  }, [liveCentsFromExpected, liveHeardAtMs, liveStepIndex, practiceMode]);
+  useEffect(() => {
+    if (practiceMode !== "active" || liveHeardAtMs === null) return;
+    if (liveNowMs - liveHeardAtMs > LIVE_READOUT_STALE_MS) {
+      liveReadingsRef.current.values = [];
+      setLiveIntonation(null);
+    }
+  }, [liveNowMs, liveHeardAtMs, practiceMode]);
   const liveBand = STRICTNESS_BANDS[gradeStrictness];
   const liveBetweenNotes = liveIntonation !== null && Math.abs(liveIntonation) > LIVE_READOUT_BETWEEN_NOTES_CENTS;
   const intonationLabel =
     liveIntonation === null
       ? "Listening…"
       : liveBetweenNotes
-        ? "Between notes"
+        ? "Different note"
         : Math.abs(liveIntonation) <= liveBand.inTuneCents
           ? "In tune"
           : Math.abs(liveIntonation) <= liveBand.closeCents
@@ -2314,7 +2335,11 @@ export default function App({ config = DEFAULT_APP_CONFIG }: { config?: AppConfi
                     <div style={styles.readoutLabel}>Intonation</div>
                     <div style={{ ...styles.readoutValueLarge, color: intonationColor }}>{intonationLabel}</div>
                     <div style={styles.diagnosticHint}>
-                      {liveBetweenNotes ? "cursor and note don't match yet" : liveIntonation === null ? "—" : `${formatCents(liveIntonation)} vs. expected`}
+                      {liveBetweenNotes
+                        ? `heard ${captureState.note ?? "another pitch"}, sheet says ${followerState.current.pitchLabel ?? "—"} (or the cursor is behind)`
+                        : liveIntonation === null
+                          ? "—"
+                          : `${formatCents(liveIntonation)} vs. ${followerState.current.pitchLabel ?? "expected"}`}
                     </div>
                   </div>
                 </>

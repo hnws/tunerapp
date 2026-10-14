@@ -122,13 +122,18 @@ def convert_beat_to_quarter(score_part: Part, beat: float) -> float:
     return float(score_part.quarter_map(timeline_time))
 
 
-def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
-    """True when one pitch class stands out in a chroma frame -- see REJECT_CHROMA_FLATNESS."""
+def chroma_flatness(chroma_frame: np.ndarray) -> float:
+    """mean / peak of a chroma frame: 1/12 for a single pitch class, 1 for a flat spectrum. Digital
+    silence normalizes to an all-zero vector, whose mean is 0 -- maximally "peaked" by the
+    measure, so it is reported as flat."""
     chroma = np.asarray(chroma_frame, dtype=np.float32).reshape(-1)
     peak = float(chroma.max()) if chroma.size else 0.0
-    # Digital silence normalizes to an all-zero vector, whose mean is 0 -- maximally "peaked" by
-    # the flatness measure, so it needs its own check.
-    return peak > 0.0 and float(chroma.mean()) / peak <= REJECT_CHROMA_FLATNESS
+    return 1.0 if peak <= 0.0 else float(chroma.mean()) / peak
+
+
+def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
+    """True when one pitch class stands out in a chroma frame -- see REJECT_CHROMA_FLATNESS."""
+    return chroma_flatness(chroma_frame) <= REJECT_CHROMA_FLATNESS
 
 
 # The tonality test above lets anything with a clear pitch through, and so did talking (voiced
@@ -158,9 +163,24 @@ def is_tonal_frame(chroma_frame: np.ndarray) -> bool:
 # Earlier measurements (TTS speech and synthetic bumps, .scratch/gate_sim.py): violin frames kept
 # 99.8% (fast Bach) and 98.8-99.6% (user takes); synthetic bumps 0%. Accepted speech frames still
 # move the cursor, so this is fewer false advances, not none.
+# - Pizzicato (2026-10-13): a pluck halves in 30-50 ms, so by the fourth frame its level has
+#   fallen far below the opening test's 0.9 ratio, and because the gate closes in the silence
+#   between plucks every pluck had to re-earn it -- the real pizzicato takes of 2026-10-13 had
+#   26% / 36% of their plucks accepted and graded almost nothing. A second way to open: a pluck
+#   is one string sounding alone, so its chroma is strongly peaked (flatness ~0.23 median on
+#   those takes, 0.41 p90 right after the attack), while a bump rings several open strings at
+#   once (synthetic knock + four strings: 0.40-0.43) and speech sits at 0.35. So
+#   PLAYING_GATE_PLUCK_FRAMES of steady pitch class whose flatness stays <= PLAYING_GATE_PLUCK_FLATNESS
+#   open the gate whether or not the level is falling. Measured (tools/dsp/gate_pluck.py on the
+#   lesson clips + the two takes + the bump clip): plucks caught 26% -> 80% (45 s take), bump
+#   unchanged (40% of knocks, 13% of their frames -- the same frames the old rule let through),
+#   speech 2.5% -> 3.9% of frames, violin 79% -> 87%. 0.35 would have let 80% of the bumps in;
+#   shortening the steady-level test to two frames instead would have too.
 PLAYING_GATE_OPEN_FRAMES = 4
 PLAYING_GATE_STABILITY = 0.9
 PLAYING_GATE_OPEN_LEVEL_RATIO = 0.9
+PLAYING_GATE_PLUCK_FRAMES = 2
+PLAYING_GATE_PLUCK_FLATNESS = 0.30
 PLAYING_GATE_RESUME_FRAMES = 3
 PLAYING_GATE_BACKFILL_FRAMES = 15
 SPEECH_PROBABILITY = 0.5
@@ -187,7 +207,7 @@ class PlayingGate:
         self.rejected = 0
         self.rejected_as_speech = 0
         self._speech_hangover = 0
-        self._recent: list[tuple[bool, np.ndarray, float]] = []  # (tonal, unit chroma, rms)
+        self._recent: list[tuple[bool, np.ndarray, float, float]] = []  # (tonal, unit chroma, rms, flatness)
         self._pending: list[object] = []  # tonal frames seen while closed, newest last
         self._since_closed = PLAYING_GATE_RESUME_FRAMES + 1
 
@@ -195,7 +215,7 @@ class PlayingGate:
         if len(self._recent) < k:
             return False
         window = self._recent[-k:]
-        if not all(tonal for tonal, _, _ in window):
+        if not all(entry[0] for entry in window):
             return False
         return all(float(a[1] @ b[1]) >= PLAYING_GATE_STABILITY for a, b in zip(window, window[1:]))
 
@@ -207,9 +227,10 @@ class PlayingGate:
         self._speech_hangover = max(0, self._speech_hangover - 1)
         if speech:
             self.rejected_as_speech += 1
-        tonal = is_tonal_frame(chroma) and not speech
+        flat = chroma_flatness(chroma)
+        tonal = flat <= REJECT_CHROMA_FLATNESS and not speech
         unit = chroma / (float(np.linalg.norm(chroma)) + 1e-9)
-        self._recent.append((tonal, unit, float(rms)))
+        self._recent.append((tonal, unit, float(rms), flat))
         del self._recent[:-PLAYING_GATE_OPEN_FRAMES]
 
         if not self.open:
@@ -222,12 +243,14 @@ class PlayingGate:
             if len(self._pending) > PLAYING_GATE_BACKFILL_FRAMES:
                 self._pending.pop(0)
                 self.rejected += 1
-            levels = [r for _, _, r in self._recent]
+            levels = [r for _, _, r, _ in self._recent]
             resuming = self._since_closed <= PLAYING_GATE_RESUME_FRAMES
             self._since_closed += 1
-            if resuming or (
-                self._stable(PLAYING_GATE_OPEN_FRAMES) and levels[-1] >= PLAYING_GATE_OPEN_LEVEL_RATIO * max(levels)
-            ):
+            steady = self._stable(PLAYING_GATE_OPEN_FRAMES) and levels[-1] >= PLAYING_GATE_OPEN_LEVEL_RATIO * max(levels)
+            pluck = self._stable(PLAYING_GATE_PLUCK_FRAMES) and all(
+                f <= PLAYING_GATE_PLUCK_FLATNESS for _, _, _, f in self._recent[-PLAYING_GATE_PLUCK_FRAMES:]
+            )
+            if resuming or steady or pluck:
                 self.open = True
                 released, self._pending = self._pending, []
                 self.accepted += len(released)
